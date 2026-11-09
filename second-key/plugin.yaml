@@ -1,0 +1,36 @@
+manifest_version: 2
+api_version: 1
+name: second-key
+version: "0.1.0"
+requires_hermes: ">=0.23.0"
+license: MIT
+provides_hooks:
+  - pre_approval_request
+  - pre_gateway_dispatch
+provides_commands:
+  - secondkey
+config_schema:
+  approvers:
+    type: list
+    default: []
+    description: Telegram approvers and their optional platform aliases.
+  required:
+    type: int
+    default: 1
+    description: Yes votes required for ordinary requests.
+  critical_required:
+    type: int
+    default: 2
+    description: Yes votes required when a critical pattern matches.
+  critical_patterns:
+    type: list
+    default: []
+    description: Regular expressions matching critical commands.
+  unknown_requester_required:
+    type: int
+    default: 2
+    description: Yes votes required when the requester identity is unknown.
+  bot_token:
+    type: secret
+    env: SECONDKEY_TELEGRAM_BOT_TOKEN
+    description: Telegram bot token used to deliver approval requests.
