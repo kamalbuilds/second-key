@@ -73,11 +73,12 @@ def _get_ledger() -> Ledger:
     return _ledger
 
 
-def _record(event: str, **fields) -> None:
+def _record(event: str, **fields) -> dict | None:
     try:
-        _get_ledger().append(event, **fields)
+        return _get_ledger().append(event, **fields)
     except Exception as exc:  # a broken ledger must never decide an approval
         logger.warning("second-key: ledger write failed (%s)", type(exc).__name__)
+        return None
 
 
 def _expire_bindings(now: float) -> None:
@@ -205,7 +206,6 @@ def _on_vote(request_id: str, voter: str, choice: str) -> str:
 
 
 def _on_start(user_id: str, chat_id: str) -> None:
-    _record("enrolled", telegram_id=user_id)
     try:
         client, _ = _bot()
         client.call("sendMessage", {"chat_id": chat_id, "text":
@@ -281,9 +281,11 @@ def present(request) -> Any:
         _ballots.pop(request.request_id, None)
     ballot.done.set()  # late taps are ignored from here on
     outcome = ballot.outcome
-    _record("decided", **base, outcome=outcome, yes=sorted(ballot.yes.values()), no=ballot.no,
-            ignored=ballot.ignored)
+    entry = _record("decided", **base, outcome=outcome, yes=sorted(ballot.yes.values()), no=ballot.no,
+                    ignored=ballot.ignored)
     summary = _closing_text(request, ballot, outcome)
+    if entry:
+        summary += f"\n\nledger {entry['hash'][:16]}"
     # Closing the DMs must not push the answer past Hermes' deadline: do it off this thread.
     threading.Thread(target=_close_all, args=(client, sent, summary), name="second-key-close",
                      daemon=True).start()
@@ -296,7 +298,8 @@ def _close_all(client, sent, summary) -> None:
 
 
 def _ballot_text(request, requester: quorum.Requester, requester_name: str, ballot: quorum.Ballot) -> str:
-    who = f"{requester_name} ({requester.platform})" if requester.known else "unknown requester"
+    who = (f"{requester_name} ({requester.platform} id {requester.user_id})" if requester.known
+           else "unknown requester")
     lines = [
         "Hermes wants to run a command that needs approval.",
         f"Asked by: {who}",

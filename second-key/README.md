@@ -26,7 +26,7 @@ second-key reverses that. The requester is excluded, a quorum of other people de
 
 ## How it works
 
-1. `pre_approval_request` runs on the agent's own thread, where the turn's sender is bound. second-key records the sender (`HERMES_SESSION_ACTOR_ID`, which is set in shared group chats too) against the request id.
+1. `pre_approval_request` runs on the agent's own thread, where the turn's sender is bound. second-key records the sender against the request id. It reads `HERMES_SESSION_ACTOR_ID` where Hermes provides it, which covers shared group chats, and falls back to `HERMES_SESSION_USER_ID`. A chat turn with neither is denied.
 2. Hermes hands the redacted request to the `secondkey` approval transport on a worker thread. second-key works out how many approvals it needs and who is eligible: the roster minus the requester.
 3. Each eligible approver gets a DM with the command, the reason Hermes gave, who asked, and **Approve once** / **Deny** buttons.
 4. A vote counts only when Telegram reports it came from an eligible approver. One deny closes the request. Enough yes votes close it as approved.
@@ -36,7 +36,7 @@ Rules that decide the number of approvals, largest wins:
 
 - `required` (default 1) for any flagged command
 - `critical_required` (default 2) when the command matches one of `critical_patterns`
-- `unknown_requester_required` (default 2) when the turn carries no sender id, for example a cron job or a local session
+- `unknown_requester_required` (default 2) when the turn comes from a local session with no chat sender. Cron jobs never reach an approval transport: Hermes applies `approvals.cron_mode` to them.
 
 second-key denies at once, and DMs nobody, when:
 
@@ -84,7 +84,7 @@ Hermes asks for some other approvals (protected file writes, computer use, MCP e
 
 ## The ledger
 
-Every presentation, vote, refusal, refused chat command, refused tool call and decision is appended to `plugin-data/second-key/ledger.jsonl` in your Hermes home. Each line stores the SHA-256 of the line before it, so editing or deleting an entry before the last one breaks the chain and `/secondkey ledger` reports the first broken line.
+Every presentation, vote, refusal, refused chat command, refused tool call and decision is appended to `plugin-data/second-key/ledger.jsonl` in your Hermes home. Each line stores the SHA-256 of the line before it, so editing or deleting an entry before the last one breaks the chain and `/secondkey ledger` reports the first broken line. Each closing DM carries the first 16 characters of its decision's hash, so every approver keeps a copy of the record outside the machine that runs Hermes.
 
 ## What it touches
 

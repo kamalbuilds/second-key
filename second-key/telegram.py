@@ -117,7 +117,11 @@ class Poller:
                     timeout=_TIMEOUT)
                 backoff = 1.0
             except TelegramError as exc:
-                logger.warning("second-key: %s; retrying in %.0fs", exc, backoff)
+                if "409" in str(exc):
+                    logger.error("second-key: another process is reading this bot's updates (409 Conflict). "
+                                 "Give second-key its own bot token; votes may be lost until then.")
+                else:
+                    logger.warning("second-key: %s; retrying in %.0fs", exc, backoff)
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 30.0)
                 continue
