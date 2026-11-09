@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any
 
-from . import quorum
+from . import quorum, tripwire
 from .ledger import Ledger
 from .telegram import BotClient, Poller, TelegramError
 
@@ -27,6 +27,9 @@ TOKEN_ENV = "SECONDKEY_TELEGRAM_BOT_TOKEN"
 _BINDING_TTL = 900.0
 MAX_COMMAND_CHARS = 3000  # Telegram messages cap at 4096; approvers must see the whole command
 _GATED_COMMANDS = frozenset({"yolo", "approvals"})
+# /loop, /queue, /bg, /steer and friends replay their argument later as an internal event, which
+# skips this hook, so a gated command inside any slash command is refused here.
+_GATED_TOKEN = re.compile(r"(^|\s)/(yolo|approvals)\b", re.IGNORECASE)
 TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person  # an approval is presented within seconds of its hook; stale bindings expire
 
 _ctx: Any = None
@@ -128,7 +131,9 @@ def _on_pre_gateway_dispatch(event=None, **kwargs):
     let anyone approve their own command with no vote. While second-key is installed they are
     refused from every chat; the profile owner changes them from the local CLI."""
     command = _command_of(event)
-    if command not in _GATED_COMMANDS:
+    text = str(getattr(event, "text", "") or "")
+    wrapped = bool(command) and _GATED_TOKEN.search(text) is not None
+    if command not in _GATED_COMMANDS and not wrapped:
         return None
     src = getattr(event, "source", None)
     platform = getattr(getattr(src, "platform", None), "value", getattr(src, "platform", "")) or ""
@@ -137,18 +142,20 @@ def _on_pre_gateway_dispatch(event=None, **kwargs):
     return {"action": "skip", "reason": f"second-key: /{command} is not available from chats"}
 
 
-_TAMPER_PARTS = (
-    r"hermes\S*\s+(config\s+(set|unset|edit|migrate)|plugins?\s+(disable|remove|uninstall|update|install)|approvals?\b|auth\b)",
-    r"config\.ya?ml",
-    r"\.hermes/\.env\b",
-    r"security\.approval",
-    r"approvals\.mode",
-    r"second-?key",
-)
-_TAMPER = re.compile("|".join(_TAMPER_PARTS), re.IGNORECASE)
-_SSH_PATH = re.compile(r"(^|[\s/~])\.ssh(/|\b)")
+# Narrow on purpose: the tripwire below catches config changes however they are made, so this
+# only refuses the direct commands, without blocking ordinary work that mentions config files.
+_TAMPER = re.compile(
+    r"\bhermes\S*\s+(config\s+(set|unset|edit|migrate)|plugins?\s+(disable|remove|uninstall)"
+    r"|approvals?\b|gateway\s+(restart|stop))",
+    re.IGNORECASE)
 _WRITE_TOOLS = {"write_file", "patch", "edit_file", "apply_patch", "str_replace_editor", "create_file"}
 _EXEC_TOOLS = {"terminal", "execute_code", "shell", "bash", "process"}
+_LOCAL_SURFACES = {"", "local", "cli", "tui", "desktop", "acp"}
+
+_armed_view: dict | None = None
+_tripped: list[str] = []
+_tripped_alerted = False
+_cfg_stamp: tuple | None = None
 
 
 def _arg_text(args) -> str:
@@ -157,42 +164,126 @@ def _arg_text(args) -> str:
     return str(args or "")
 
 
+def _under_ssh_dir(path: str) -> bool:
+    from pathlib import Path
+    try:
+        target = Path(path).expanduser().resolve()
+        return target.is_relative_to((Path.home() / ".ssh").resolve())
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _config_path():
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "config.yaml"
+
+
+def _current_view() -> dict:
+    from hermes_cli.config import load_config_readonly
+    return tripwire.watched(load_config_readonly() or {}, "second-key", TRANSPORT)
+
+
+def _armed_file():
+    from plugins.plugin_storage import plugin_data_dir
+    return plugin_data_dir("second-key") / "armed.json"
+
+
+def _arm(view: dict) -> None:
+    global _armed_view, _tripped, _tripped_alerted
+    _armed_view = view
+    _tripped, _tripped_alerted = [], False
+    path = _armed_file()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"fingerprint": tripwire.fingerprint(view), "view": view}, sort_keys=True))
+    tmp.replace(path)
+
+
+def _load_armed() -> None:
+    global _armed_view
+    try:
+        data = json.loads(_armed_file().read_text())
+        if data.get("fingerprint") == tripwire.fingerprint(data.get("view") or {}):
+            _armed_view = data["view"]
+    except (OSError, ValueError, KeyError):
+        _armed_view = None
+    if _armed_view is None:
+        try:
+            view = _current_view()
+        except Exception as exc:
+            logger.warning("second-key: could not read config at load (%s)", type(exc).__name__)
+            return
+        if not tripwire.problems(view):
+            _arm(view)
+            _record("armed", how="first load", fingerprint=tripwire.fingerprint(view)[:16])
+
+
+def _check_tripwire() -> list[str]:
+    """Compare the approval settings with the armed ones; re-read only when config.yaml changed."""
+    global _cfg_stamp, _tripped, _tripped_alerted
+    if _armed_view is None or _tripped:
+        return _tripped
+    try:
+        st = _config_path().stat()
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        stamp = None
+    if stamp is not None and stamp == _cfg_stamp:
+        return _tripped
+    _cfg_stamp = stamp
+    try:
+        view = _current_view()
+    except Exception as exc:
+        view = None
+        reasons = [f"could not read config.yaml ({type(exc).__name__})"]
+    if view is not None:
+        reasons = tripwire.changes(_armed_view, view) + tripwire.problems(view)
+    if reasons:
+        _tripped = reasons
+        _record("tripwire", changed=reasons)
+        _alert_approvers(reasons)
+    return _tripped
+
+
+def _alert_approvers(reasons: list[str]) -> None:
+    global _tripped_alerted
+    if _tripped_alerted:
+        return
+    _tripped_alerted = True
+    text = ("second-key: Hermes' approval settings changed since they were armed ("
+            + ", ".join(reasons)[:600] + "). The agent's tools are stopped until the profile owner "
+            "runs /secondkey arm from a local Hermes session.")
+    try:
+        client, _ = _bot()
+        for approver in _policy().approvers:
+            try:
+                client.call("sendMessage", {"chat_id": approver.telegram_id, "text": text})
+            except TelegramError as exc:
+                logger.info("second-key: tripwire alert to %s failed: %s", approver.name, exc)
+    except Exception as exc:
+        logger.warning("second-key: could not alert approvers (%s)", type(exc).__name__)
+
+
 def _on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
-    """Refuse tool calls that would change who approves, or switch approvals off. The approval
-    system cannot protect itself if the agent may rewrite its configuration unprompted."""
+    """Two jobs. Stop every tool call while the approval settings differ from the armed ones, and
+    refuse the direct commands an agent would use to switch approvals off or rewrite ~/.ssh."""
+    reasons = _check_tripwire()
     name = str(tool_name or "")
-    if name not in _EXEC_TOOLS and name not in _WRITE_TOOLS:
-        return None
-    text = _arg_text(args)
-    if name in _WRITE_TOOLS and _SSH_PATH.search(text):
+    if reasons:
+        return {"action": "block", "message": (
+            "second-key: Hermes' approval settings changed since they were armed ("
+            + ", ".join(reasons)[:300] + "). Tools are stopped until the profile owner runs "
+            "/secondkey arm from a local Hermes session.")}
+    if name in _WRITE_TOOLS and isinstance(args, dict) and _under_ssh_dir(str(args.get("path") or args.get("file_path") or "")):
         _record("tool_refused", tool=name, why="writes under ~/.ssh")
         return {"action": "block", "message": (
             "second-key: writes under ~/.ssh can make later ssh commands run anything, and Hermes "
             "asks for them in chat where the requester can answer. Refused.")}
-    if not _TAMPER.search(text):
-        return None
-    _record("tool_refused", tool=name, why="touches approval configuration")
-    return {"action": "block", "message": (
-        "second-key: this would change Hermes' approval settings or the approver roster. "
-        "Only the profile owner can do that, from outside the agent.")}
-
-
-def _arming_problems() -> list[str]:
-    """Settings under which second-key is installed but not actually deciding approvals."""
-    from hermes_cli.config import load_config_readonly
-    cfg = load_config_readonly() or {}
-    security = (cfg.get("security") or {}).get("approval") or {}
-    problems = []
-    if str(security.get("transport") or "builtin").lower() != TRANSPORT:
-        problems.append(f"security.approval.transport is {security.get('transport') or 'builtin'!r}, not {TRANSPORT!r}")
-    if str(security.get("transport_fallback") or "").lower() == "builtin":
-        problems.append("transport_fallback: builtin lets a failed transport fall back to the chat prompt")
-    mode = str((cfg.get("approvals") or {}).get("mode") or "").lower()
-    if mode in {"off", "smart"}:
-        problems.append(f"approvals.mode is {mode!r}: Hermes decides some commands without asking")
-    if str((cfg.get("plugins") or {}).get("isolation") or "").lower() == "host":
-        problems.append("plugins.isolation: host is set; approval transports need in-process plugins")
-    return problems
+    if name in _EXEC_TOOLS and _TAMPER.search(_arg_text(args)):
+        _record("tool_refused", tool=name, why="changes approval configuration")
+        return {"action": "block", "message": (
+            "second-key: this would change Hermes' approval settings or turn second-key off. "
+            "Only the profile owner can do that, from outside the agent.")}
+    return None
 
 
 def _on_vote(request_id: str, voter: str, choice: str) -> str:
@@ -335,17 +426,40 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
         head = f"ledger chain {'intact' if ok else f'BROKEN at line {bad}'}"
         return "\n".join([head] + [f"{e['ts']} {e['event']} {e.get('outcome') or e.get('result') or ''}".rstrip()
                                    for e in entries])
+    if action == "arm":
+        platform = str(kwargs.get("platform") or _session("HERMES_SESSION_PLATFORM") or "").lower()
+        if platform not in _LOCAL_SURFACES:
+            return "second-key: /secondkey arm only works from a local Hermes session (CLI, TUI or Desktop)."
+        try:
+            _policy()
+            view = _current_view()
+        except Exception as exc:
+            return f"second-key: not armed: {exc}"
+        problems = tripwire.problems(view)
+        if problems:
+            return "second-key: not armed:\n" + "\n".join(f"  - {p}" for p in problems)
+        _arm(view)
+        fp = tripwire.fingerprint(view)[:16]
+        _record("armed", how="/secondkey arm", fingerprint=fp)
+        return f"second-key armed (settings fingerprint {fp}). Tools are running again."
     try:
         policy = _policy()
     except ValueError as exc:
         return f"second-key is NOT armed: {exc}"
     lines = []
-    try:
-        problems = _arming_problems()
-    except Exception as exc:
-        problems = [f"could not read Hermes config ({type(exc).__name__})"]
-    lines.append("ARMED" if not problems else "NOT ARMED:")
-    lines.extend(f"  - {p}" for p in problems)
+    reasons = _check_tripwire()
+    if _armed_view is None:
+        try:
+            problems = tripwire.problems(_current_view())
+        except Exception as exc:
+            problems = [f"could not read Hermes config ({type(exc).__name__})"]
+        lines.append("NOT ARMED:" if problems else "not armed yet: run /secondkey arm from a local session")
+        lines.extend(f"  - {p}" for p in problems)
+    elif reasons:
+        lines.append("TRIPPED, agent tools stopped:")
+        lines.extend(f"  - {r}" for r in reasons)
+    else:
+        lines.append(f"ARMED (settings fingerprint {tripwire.fingerprint(_armed_view)[:16]})")
     lines.extend(quorum.describe(policy))
     from agent.secret_scope import get_secret
     lines.append(f"bot token: {'set' if get_secret(TOKEN_ENV) else 'MISSING'} ({TOKEN_ENV})")
@@ -359,7 +473,8 @@ def register(ctx) -> None:
     ctx.register_hook("pre_approval_request", _on_pre_approval_request)
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    _load_armed()
     ctx.register_approval_transport(TRANSPORT, present)
     ctx.register_command("secondkey", _cmd_secondkey,
                          description="second-key status, or `ledger [n]` for recent decisions",
-                         args_hint="[status|ledger [n]]")
+                         args_hint="[status|arm|ledger [n]]")

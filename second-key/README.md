@@ -47,8 +47,9 @@ second-key denies at once, and DMs nobody, when:
 ## What it guards
 
 - **Commands:** dangerous terminal commands and `execute_code` scripts that Hermes sends to its approval transport.
-- **Chat commands:** `/yolo` and `/approvals` switch approvals off or down for the whole profile, so second-key drops them from every chat before they reach Hermes. The profile owner changes them from the local CLI.
-- **The agent editing its own guard:** a `pre_tool_call` hook refuses terminal, `execute_code` and file-write calls that touch `hermes config`, `hermes plugins`, `config.yaml`, the profile `.env` or second-key's settings, and file writes under `~/.ssh`.
+- **Chat commands:** `/yolo` and `/approvals` switch approvals off or down for the whole profile, so second-key drops them from every chat before they reach Hermes, including when they are wrapped in `/loop`, `/queue`, `/bg`, `/steer` or `/heartbeat`. The profile owner changes them from the local CLI.
+- **The agent editing its own guard:** when second-key arms, it records the settings that decide approvals: the selected transport, the fallback, `approvals.mode`, plugin isolation, and its own roster and rules. Before every tool call it checks them again. If any of them changed, however the change was made, it stops every tool call and DMs the approvers which settings changed. The profile owner resumes the agent by running `/secondkey arm` from a local Hermes session; the command is refused from chats.
+- **Direct commands:** `hermes config set|unset|edit`, `hermes plugins disable|remove`, `hermes approvals` and `hermes gateway restart|stop` are refused before they run, and so are file writes under `~/.ssh`.
 
 Hermes asks for some other approvals (protected file writes, computer use, MCP elicitation) on its own chat prompts, which do not go through approval transports. `/secondkey` checks whether second-key is actually armed: selected as the transport, no builtin fallback, and `approvals.mode` not `off` or `smart`.
 
@@ -80,7 +81,7 @@ Hermes asks for some other approvals (protected file writes, computer use, MCP e
        transport: secondkey
    ```
    `aliases` lists the same person's ids on other chat platforms, so a request Priya starts from Discord is still hers. Critical patterns match case-insensitively.
-5. Check it: `/secondkey` shows whether second-key is armed, the policy, and whether the token is set. `/secondkey ledger 20` shows recent decisions and whether the ledger chain is intact.
+5. Arm it: second-key arms itself on first load when the settings above are in place. To change the roster or rules later, edit `config.yaml`, then run `/secondkey arm` from a local session. `/secondkey` shows whether it is armed, the policy, and whether the token is set. `/secondkey ledger 20` shows recent decisions and whether the ledger chain is intact.
 
 ## The ledger
 
@@ -91,7 +92,7 @@ Every presentation, vote, refusal, refused chat command, refused tool call and d
 - **Network:** `api.telegram.org` only, with the bot token from `SECONDKEY_TELEGRAM_BOT_TOKEN`. Redirects are refused.
 - **What approvers see:** the command after Hermes' own redaction, Hermes' reason for asking, and the requester's display name and platform.
 - **Background thread:** one long-poll thread reads the bot's updates. It starts on the first approval or `/start` and runs until Hermes exits.
-- **Files:** writes only its ledger under `plugin-data/second-key/`. Reads Hermes' `config.yaml` (read-only) for the `/secondkey` arming check.
+- **Files:** writes its ledger and the armed settings (`armed.json`) under `plugin-data/second-key/`. Reads Hermes' `config.yaml` (read-only) before tool calls, re-parsing it only when the file changed.
 - **Credentials:** reads the bot token through `agent.secret_scope.get_secret`. It never reads `.env`, `auth.json` or any other credential store.
 - **No telemetry, no self-updater, no shell commands, no dependencies beyond the standard library.**
 
@@ -112,6 +113,8 @@ The suite drives the plugin through Hermes' real `ApprovalRequest`, `invoke_appr
 - ledger tampering (chain reported broken)
 - shared-group turns where only the actor id is set
 - `/approvals off`, `/yolo` from an approver, and `/yolo` behind an attachment line
-- the agent running `hermes config set approvals.mode off` or writing `config.yaml` or `~/.ssh/config`
+- the agent running `hermes config set approvals.mode off`, or editing `config.yaml` by any other route (the next tool call is stopped and approvers are alerted)
+- `/approvals off` and `/yolo` wrapped in `/loop` and similar commands
+- ordinary developer commands that mention config files passing untouched
 
 Each guard was checked by breaking it and watching its test fail.

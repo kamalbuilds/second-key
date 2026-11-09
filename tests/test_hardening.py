@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from gateway.config import Platform
@@ -98,6 +99,10 @@ class CommandGateTests(Base):
     def test_question_mentioning_yolo_passes(self):
         self.assertIsNone(plugin._on_pre_gateway_dispatch(event=msg("how do I turn on /yolo mode?")))
 
+    def test_wrapped_gated_commands_refused(self):
+        for text in ("/loop 1m /approvals off", "/queue /yolo", "/bg /yolo", "/steer /approvals smart", "/heartbeat /yolo"):
+            self.assertEqual(plugin._on_pre_gateway_dispatch(event=msg(text))["action"], "skip", text)
+
     def test_ordinary_message_passes(self):
         self.assertIsNone(plugin._on_pre_gateway_dispatch(event=msg("deploy the docs site")))
 
@@ -107,23 +112,122 @@ class TamperTests(Base):
         out = plugin._on_pre_tool_call(tool_name=tool, args=args)
         return bool(out) and out.get("action") == "block"
 
-    def test_c2_config_set_blocked(self):
+    def test_c2_direct_disable_commands_blocked(self):
         self.assertTrue(self.blocked("terminal", command="hermes config set approvals.mode off"))
         self.assertTrue(self.blocked("terminal", command="hermes config set security.approval.transport builtin"))
         self.assertTrue(self.blocked("terminal", command="hermes plugins disable second-key"))
 
-    def test_c2_execute_code_editing_config_blocked(self):
-        self.assertTrue(self.blocked("execute_code", code="open('/home/u/.hermes/config.yaml','w').write('x')"))
-
-    def test_c2_write_file_to_config_blocked(self):
-        self.assertTrue(self.blocked("write_file", path="/home/u/.hermes/config.yaml", content="approvals: {}"))
-
     def test_h4_ssh_config_write_blocked(self):
-        self.assertTrue(self.blocked("write_file", path="/home/u/.ssh/config", content="ProxyCommand sh"))
+        self.assertTrue(self.blocked("write_file", path=str(Path.home() / ".ssh" / "config"), content="x"))
+        self.assertTrue(self.blocked("write_file", path="~/.ssh/authorized_keys", content="x"))
 
-    def test_ordinary_commands_pass(self):
-        self.assertFalse(self.blocked("terminal", command="pytest -q"))
-        self.assertFalse(self.blocked("write_file", path="src/app.py", content="print(1)"))
+    def test_ordinary_work_passes(self):
+        for tool, args in [("terminal", {"command": "pytest -q"}),
+                           ("terminal", {"command": "kubectl apply -f deploy/config.yaml"}),
+                           ("terminal", {"command": "docker compose -f config.yml up -d"}),
+                           ("terminal", {"command": "git commit -m 'read approvals.mode from env'"}),
+                           ("write_file", {"path": "app/config.yaml", "content": "port: 8080"}),
+                           ("write_file", {"path": "tests/fixtures/.ssh/known_hosts", "content": "x"}),
+                           ("execute_code", {"code": "import yaml; yaml.safe_load(open('config.yaml'))"})]:
+            self.assertFalse(self.blocked(tool, **args), (tool, args))
+
+
+ARMED_CFG = """security:
+  approval:
+    transport: secondkey
+approvals:
+  mode: manual
+plugins:
+  entries:
+    second-key:
+      settings:
+        approvers:
+          - {name: Dev, telegram_id: "222"}
+"""
+
+
+class TripwireTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name)
+        (self.home / "config.yaml").write_text(ARMED_CFG)
+        self.env = patch.dict(os.environ, {"HERMES_HOME": str(self.home)})
+        self.env.start()
+        self.originals = (plugin._bot,)
+        self.alerts = []
+        plugin._bot = lambda: (_AlertClient(self.alerts), None)
+        plugin._ledger = None
+        plugin._armed_view, plugin._tripped, plugin._tripped_alerted, plugin._cfg_stamp = None, [], False, None
+        plugin._ctx = _Ctx(self.home)
+        plugin._load_armed()
+
+    def tearDown(self):
+        (plugin._bot,) = self.originals
+        plugin._armed_view, plugin._tripped, plugin._tripped_alerted, plugin._cfg_stamp = None, [], False, None
+        plugin._ledger = None
+        self.env.stop()
+        self.temp.cleanup()
+
+    def tool(self, command="pytest -q"):
+        return plugin._on_pre_tool_call(tool_name="terminal", args={"command": command})
+
+    def edit(self, old, new):
+        import os
+        import time
+        path = self.home / "config.yaml"
+        path.write_text(path.read_text().replace(old, new))
+        future = time.time() + 2
+        os.utime(path, (future, future))
+
+    def test_armed_on_first_load_and_tools_run(self):
+        self.assertIsNotNone(plugin._armed_view)
+        self.assertIsNone(self.tool())
+
+    def test_glob_sed_to_mode_off_trips_and_stops_tools(self):
+        self.edit("mode: manual", "mode: off")  # unquoted: YAML reads False
+        out = self.tool()
+        self.assertEqual(out["action"], "block")
+        self.assertIn("approvals_mode", out["message"])
+        self.assertTrue(self.alerts, "approvers were not alerted")
+
+    def test_transport_switch_trips(self):
+        self.edit("transport: secondkey", "transport: builtin")
+        self.assertEqual(self.tool()["action"], "block")
+
+    def test_roster_change_trips(self):
+        self.edit('telegram_id: "222"', 'telegram_id: "999"')
+        self.assertEqual(self.tool()["action"], "block")
+
+    def test_arm_refused_from_chat_and_with_problems_then_allowed_locally(self):
+        self.edit("mode: manual", "mode: off")
+        self.assertEqual(self.tool()["action"], "block")
+        self.assertIn("local", plugin._cmd_secondkey("arm", platform="telegram"))
+        self.assertIn("not armed", plugin._cmd_secondkey("arm", platform="cli"))
+        self.edit("mode: off", "mode: manual")
+        self.assertIn("armed", plugin._cmd_secondkey("arm", platform="cli"))
+        self.assertIsNone(self.tool())
+
+
+class _AlertClient:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def call(self, method, payload, timeout=15):
+        self.sink.append((method, payload.get("chat_id")))
+        return {}
+
+
+class _Ctx:
+    """Reads plugin settings from the temp HERMES_HOME the way PluginContext.get_config does."""
+    def __init__(self, home):
+        self.home = home
+
+    def get_config(self, key, default=None):
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        settings = ((cfg.get("plugins") or {}).get("entries") or {}).get("second-key", {}).get("settings") or {}
+        return settings.get(key, default)
 
 
 class QuorumTests(Base):
