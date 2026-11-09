@@ -90,7 +90,7 @@ Every presentation, vote, refusal, refused chat command, refused tool call and d
 ## What it touches
 
 - **Network:** `api.telegram.org` only, with the bot token from `SECONDKEY_TELEGRAM_BOT_TOKEN`. Redirects are refused.
-- **What approvers see:** the command after Hermes' own redaction, Hermes' reason for asking, and the requester's display name and platform.
+- **What approvers see:** the command after Hermes' own redaction, Hermes' reason for asking, and the requester's display name, platform and platform user id.
 - **Background thread:** one long-poll thread reads the bot's updates. It starts on the first approval or `/start` and runs until Hermes exits.
 - **Files:** writes its ledger and the armed settings (`armed.json`) under `plugin-data/second-key/`. Reads Hermes' `config.yaml` (read-only) before tool calls, re-parsing it only when the file changed.
 - **Credentials:** reads the bot token through `agent.secret_scope.get_secret`. It never reads `.env`, `auth.json` or any other credential store.
