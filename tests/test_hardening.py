@@ -160,3 +160,42 @@ class LedgerTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeClient:
+    def __init__(self):
+        self.sent, self.closed = [], []
+
+    def send_ballot(self, chat_id, text, request_id):
+        self.sent.append((chat_id, text, request_id))
+        return len(self.sent)
+
+    def close_ballot(self, chat_id, message_id, text):
+        self.closed.append(text)
+
+
+class AnchorTests(Base):
+    def test_l2_closing_dm_carries_decision_hash(self):
+        import threading
+        import time
+        client = FakeClient()
+        plugin._bot = lambda: (client, None)
+        req = request()
+        self.bind(req, platform="telegram", actor_id="111", actor_name="Priya")
+        out = []
+        worker = threading.Thread(target=lambda: out.append(plugin.present(req)))
+        worker.start()
+        for _ in range(50):
+            if client.sent:
+                break
+            time.sleep(0.05)
+        self.assertIn("telegram id 111", client.sent[0][1])
+        plugin._on_vote(req.request_id, "222", "once")
+        worker.join(5)
+        self.assertEqual(out[0].choice, "once")
+        for _ in range(50):
+            if len(client.closed) == len(client.sent):
+                break
+            time.sleep(0.05)
+        decided = [e for e in plugin._get_ledger().entries() if e["event"] == "decided"][-1]
+        self.assertTrue(all(f"ledger {decided['hash'][:16]}" in text for text in client.closed))
