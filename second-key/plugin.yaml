@@ -2,6 +2,10 @@ manifest_version: 2
 api_version: 1
 name: second-key
 version: "0.1.0"
+description: >-
+  A two-person rule for shared Hermes bots. Dangerous commands go to named approvers by Telegram
+  DM, the person who asked can never approve their own request, and critical commands need two
+  approvals. No answer, an error or too few approvers always means deny.
 requires_hermes: ">=0.23.0"
 license: MIT
 provides_hooks:
@@ -34,3 +38,4 @@ config_schema:
     type: secret
     env: SECONDKEY_TELEGRAM_BOT_TOKEN
     description: Telegram bot token used to deliver approval requests.
+author: kamalbuilds
