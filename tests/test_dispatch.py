@@ -33,9 +33,9 @@ class YoloGateTests(unittest.TestCase):
         out = plugin._on_pre_gateway_dispatch(event=event("/yolo", "telegram", "999"))
         self.assertEqual(out["action"], "skip")
 
-    def test_yolo_from_roster_member_passes(self):
-        self.assertIsNone(plugin._on_pre_gateway_dispatch(event=event("/yolo on", "telegram", "222")))
-        self.assertIsNone(plugin._on_pre_gateway_dispatch(event=event("/YOLO", "discord", "42")))
+    def test_yolo_from_roster_member_is_also_dropped(self):
+        self.assertEqual(plugin._on_pre_gateway_dispatch(event=event("/yolo on", "telegram", "222"))["action"], "skip")
+        self.assertEqual(plugin._on_pre_gateway_dispatch(event=event("/YOLO", "discord", "42"))["action"], "skip")
 
     def test_other_messages_pass(self):
         self.assertIsNone(plugin._on_pre_gateway_dispatch(event=event("run the tests", "telegram", "999")))

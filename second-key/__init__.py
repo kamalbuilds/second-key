@@ -1,14 +1,17 @@
 """second-key: the person who asks for a dangerous command can never be the one who approves it.
 
-Selected with ``security.approval.transport: secondkey``. Each approval Hermes raises is sent by
-Telegram DM to the approvers on a roster. The requester's own vote is never counted, critical
-commands need more yes votes, and a request whose requester is unknown needs more still. Any
-error, timeout or missing configuration is a deny; Hermes enforces the deny host-side.
+Selected with ``security.approval.transport: secondkey``. Dangerous terminal commands and
+execute_code scripts that Hermes routes to its approval transport are sent by Telegram DM to the
+approvers on a roster. The requester's own vote is never counted, critical commands need more yes
+votes, and any error, timeout, unidentified sender or missing configuration is a deny, which Hermes
+enforces host-side. Chat commands and tool calls that would switch approvals off are refused.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 import time
 from typing import Any
@@ -21,7 +24,10 @@ logger = logging.getLogger(__name__)
 
 TRANSPORT = "secondkey"
 TOKEN_ENV = "SECONDKEY_TELEGRAM_BOT_TOKEN"
-_BINDING_TTL = 900.0  # an approval is presented within seconds of its hook; stale bindings expire
+_BINDING_TTL = 900.0
+MAX_COMMAND_CHARS = 3000  # Telegram messages cap at 4096; approvers must see the whole command
+_GATED_COMMANDS = frozenset({"yolo", "approvals"})
+TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person  # an approval is presented within seconds of its hook; stale bindings expire
 
 _ctx: Any = None
 _bindings: dict[str, tuple[quorum.Requester, str, float]] = {}
@@ -70,8 +76,8 @@ def _get_ledger() -> Ledger:
 def _record(event: str, **fields) -> None:
     try:
         _get_ledger().append(event, **fields)
-    except OSError as exc:
-        logger.warning("second-key: ledger write failed: %s", exc)
+    except Exception as exc:  # a broken ledger must never decide an approval
+        logger.warning("second-key: ledger write failed (%s)", type(exc).__name__)
 
 
 def _expire_bindings(now: float) -> None:
@@ -86,32 +92,106 @@ def _on_pre_approval_request(request_id: str = "", **kwargs) -> None:
     worker that Hermes starts next is a fresh thread without it, so bind the requester here."""
     if not request_id:
         return
+    # ACTOR_ID is the person whose message started this turn; in a shared (observe-mode) group
+    # USER_ID is empty and only ACTOR_ID carries the sender.
     requester = quorum.Requester(platform=_session("HERMES_SESSION_PLATFORM").lower(),
-                                 user_id=_session("HERMES_SESSION_USER_ID"))
-    name = _session("HERMES_SESSION_USER_NAME") or requester.user_id
+                                 user_id=_session("HERMES_SESSION_ACTOR_ID") or _session("HERMES_SESSION_USER_ID"))
+    name = (_session("HERMES_SESSION_ACTOR_NAME") or _session("HERMES_SESSION_USER_NAME")
+            or requester.user_id)
     with _state_lock:
         now = time.monotonic()
         _expire_bindings(now)
         _bindings[request_id] = (requester, name, now)
 
 
+def _command_of(event) -> str:
+    """The slash command Hermes will run for this message, parsed the way Hermes parses it
+    (attachment prefixes and @bot suffixes stripped), with a raw-text fallback."""
+    get = getattr(event, "get_command", None)
+    if callable(get):
+        try:
+            return str(get() or "").lower()
+        except Exception:
+            logger.debug("second-key: get_command failed; using raw text")
+    for line in str(getattr(event, "text", "") or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("@"):  # attachment refs Hermes strips before the command
+            continue
+        first = line.split()[0]
+        return first[1:].split("@", 1)[0].lower() if first.startswith("/") else ""
+    return ""
+
+
 def _on_pre_gateway_dispatch(event=None, **kwargs):
-    """Close the /yolo bypass: YOLO skips approvals entirely, so only roster members may turn it on
-    from a chat. Everyone else's /yolo is dropped before it reaches the agent."""
-    text = str(getattr(event, "text", "") or "").strip().lower()
-    if not text.startswith("/yolo"):
+    """/yolo and /approvals switch Hermes' approvals off or down for the whole profile, which would
+    let anyone approve their own command with no vote. While second-key is installed they are
+    refused from every chat; the profile owner changes them from the local CLI."""
+    command = _command_of(event)
+    if command not in _GATED_COMMANDS:
         return None
     src = getattr(event, "source", None)
     platform = getattr(getattr(src, "platform", None), "value", getattr(src, "platform", "")) or ""
-    user_id = str(getattr(src, "user_id", "") or "")
-    try:
-        allowed = quorum.is_on_roster(_policy(), str(platform).lower(), user_id)
-    except ValueError:
-        allowed = False
-    if allowed:
+    _record("command_refused", command=command, platform=str(platform),
+            user_id=str(getattr(src, "user_id", "") or ""))
+    return {"action": "skip", "reason": f"second-key: /{command} is not available from chats"}
+
+
+_TAMPER_PARTS = (
+    r"hermes\S*\s+(config\s+(set|unset|edit|migrate)|plugins?\s+(disable|remove|uninstall|update|install)|approvals?\b|auth\b)",
+    r"config\.ya?ml",
+    r"\.hermes/\.env\b",
+    r"security\.approval",
+    r"approvals\.mode",
+    r"second-?key",
+)
+_TAMPER = re.compile("|".join(_TAMPER_PARTS), re.IGNORECASE)
+_SSH_PATH = re.compile(r"(^|[\s/~])\.ssh(/|\b)")
+_WRITE_TOOLS = {"write_file", "patch", "edit_file", "apply_patch", "str_replace_editor", "create_file"}
+_EXEC_TOOLS = {"terminal", "execute_code", "shell", "bash", "process"}
+
+
+def _arg_text(args) -> str:
+    if isinstance(args, dict):
+        return " ".join(str(v) for v in args.values() if isinstance(v, (str, int, float)))
+    return str(args or "")
+
+
+def _on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
+    """Refuse tool calls that would change who approves, or switch approvals off. The approval
+    system cannot protect itself if the agent may rewrite its configuration unprompted."""
+    name = str(tool_name or "")
+    if name not in _EXEC_TOOLS and name not in _WRITE_TOOLS:
         return None
-    _record("yolo_refused", platform=str(platform), user_id=user_id)
-    return {"action": "skip", "reason": "second-key: /yolo is limited to approvers"}
+    text = _arg_text(args)
+    if name in _WRITE_TOOLS and _SSH_PATH.search(text):
+        _record("tool_refused", tool=name, why="writes under ~/.ssh")
+        return {"action": "block", "message": (
+            "second-key: writes under ~/.ssh can make later ssh commands run anything, and Hermes "
+            "asks for them in chat where the requester can answer. Refused.")}
+    if not _TAMPER.search(text):
+        return None
+    _record("tool_refused", tool=name, why="touches approval configuration")
+    return {"action": "block", "message": (
+        "second-key: this would change Hermes' approval settings or the approver roster. "
+        "Only the profile owner can do that, from outside the agent.")}
+
+
+def _arming_problems() -> list[str]:
+    """Settings under which second-key is installed but not actually deciding approvals."""
+    from hermes_cli.config import load_config_readonly
+    cfg = load_config_readonly() or {}
+    security = (cfg.get("security") or {}).get("approval") or {}
+    problems = []
+    if str(security.get("transport") or "builtin").lower() != TRANSPORT:
+        problems.append(f"security.approval.transport is {security.get('transport') or 'builtin'!r}, not {TRANSPORT!r}")
+    if str(security.get("transport_fallback") or "").lower() == "builtin":
+        problems.append("transport_fallback: builtin lets a failed transport fall back to the chat prompt")
+    mode = str((cfg.get("approvals") or {}).get("mode") or "").lower()
+    if mode in {"off", "smart"}:
+        problems.append(f"approvals.mode is {mode!r}: Hermes decides some commands without asking")
+    if str((cfg.get("plugins") or {}).get("isolation") or "").lower() == "host":
+        problems.append("plugins.isolation: host is set; approval transports need in-process plugins")
+    return problems
 
 
 def _on_vote(request_id: str, voter: str, choice: str) -> str:
@@ -141,9 +221,26 @@ def present(request) -> Any:
     """Hermes calls this on a worker thread with a redacted, immutable ApprovalRequest. It returns
     ``once`` only when the quorum is met by people other than the requester; anything else is deny."""
     with _state_lock:
-        requester, requester_name, _ = _bindings.pop(request.request_id, (quorum.Requester(), "", 0.0))
+        binding = _bindings.pop(request.request_id, None)
     deny = request.respond("deny")
     if "once" not in request.allowed_choices:
+        return deny
+    if binding is None:
+        # Hermes fires pre_approval_request before every transport call. No binding means the
+        # request reached us some other way, so nobody can say who asked: refuse.
+        _record("refused", request_id=request.request_id, why="no requester binding for this request")
+        return deny
+    requester, requester_name, _ = binding
+    if requester.platform and requester.platform != "local" and not requester.user_id:
+        _record("refused", request_id=request.request_id, platform=requester.platform,
+                why="chat turn without a bound sender id")
+        return deny
+    if requester.platform == "telegram" and requester.user_id == TELEGRAM_ANONYMOUS_ADMIN:
+        _record("refused", request_id=request.request_id, why="anonymous Telegram group admin")
+        return deny
+    if len(request.command) > MAX_COMMAND_CHARS:
+        _record("refused", request_id=request.request_id, length=len(request.command),
+                why="command too long to show approvers in full")
         return deny
     try:
         policy = _policy()
@@ -184,12 +281,18 @@ def present(request) -> Any:
         _ballots.pop(request.request_id, None)
     ballot.done.set()  # late taps are ignored from here on
     outcome = ballot.outcome
-    summary = _closing_text(request, ballot, outcome)
-    for chat_id, message_id in sent:
-        client.close_ballot(chat_id, message_id, summary)
     _record("decided", **base, outcome=outcome, yes=sorted(ballot.yes.values()), no=ballot.no,
             ignored=ballot.ignored)
+    summary = _closing_text(request, ballot, outcome)
+    # Closing the DMs must not push the answer past Hermes' deadline: do it off this thread.
+    threading.Thread(target=_close_all, args=(client, sent, summary), name="second-key-close",
+                     daemon=True).start()
     return request.respond(outcome)
+
+
+def _close_all(client, sent, summary) -> None:
+    for chat_id, message_id in sent:
+        client.close_ballot(chat_id, message_id, summary)
 
 
 def _ballot_text(request, requester: quorum.Requester, requester_name: str, ballot: quorum.Ballot) -> str:
@@ -199,7 +302,7 @@ def _ballot_text(request, requester: quorum.Requester, requester_name: str, ball
         f"Asked by: {who}",
         f"Reason: {request.description}",
         "",
-        request.command[:1500],
+        request.command,
         "",
         f"Needs {ballot.required} approval(s) from people other than the requester ({ballot.reason}).",
         f"No answer within {int(request.timeout_seconds)}s means deny.",
@@ -214,7 +317,7 @@ def _closing_text(request, ballot: quorum.Ballot, outcome: str) -> str:
         verdict = f"Denied by {ballot.no}."
     else:
         verdict = f"Denied: {len(ballot.yes)} of {ballot.required} approval(s) before the deadline."
-    return f"{verdict}\n\n{request.command[:800]}"
+    return f"{verdict}\n\n{request.command}"
 
 
 # ---------------------------------------------------------------- command
@@ -233,7 +336,14 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
         policy = _policy()
     except ValueError as exc:
         return f"second-key is NOT armed: {exc}"
-    lines = list(quorum.describe(policy))
+    lines = []
+    try:
+        problems = _arming_problems()
+    except Exception as exc:
+        problems = [f"could not read Hermes config ({type(exc).__name__})"]
+    lines.append("ARMED" if not problems else "NOT ARMED:")
+    lines.extend(f"  - {p}" for p in problems)
+    lines.extend(quorum.describe(policy))
     from agent.secret_scope import get_secret
     lines.append(f"bot token: {'set' if get_secret(TOKEN_ENV) else 'MISSING'} ({TOKEN_ENV})")
     lines.append(f"select it with security.approval.transport: {TRANSPORT}")
@@ -245,6 +355,7 @@ def register(ctx) -> None:
     _ctx = ctx
     ctx.register_hook("pre_approval_request", _on_pre_approval_request)
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_approval_transport(TRANSPORT, present)
     ctx.register_command("secondkey", _cmd_secondkey,
                          description="second-key status, or `ledger [n]` for recent decisions",

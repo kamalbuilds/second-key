@@ -11,6 +11,7 @@ license: MIT
 provides_hooks:
   - pre_approval_request
   - pre_gateway_dispatch
+  - pre_tool_call
 provides_commands:
   - secondkey
 config_schema:

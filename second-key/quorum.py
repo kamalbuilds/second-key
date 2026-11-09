@@ -45,7 +45,7 @@ class Requester:
 
     @property
     def key(self) -> str:
-        return f"{self.platform}:{self.user_id}" if self.known else ""
+        return f"{self.platform.lower()}:{self.user_id}" if self.known else ""
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ class Policy:
     unknown_requester_required: int = 2
 
     def compiled_critical(self) -> list[re.Pattern]:
-        return [re.compile(p) for p in self.critical_patterns]
+        return [re.compile(p, re.IGNORECASE) for p in self.critical_patterns]
 
 
 def required_votes(policy: Policy, command: str, requester: Requester) -> tuple[int, str]:
@@ -150,20 +150,25 @@ def parse_policy(cfg: dict) -> Policy:
         raise ValueError("approvers must be a list")
     approvers: list[Approver] = []
     seen: set[str] = set()
+    seen_keys: set[str] = set()
     for entry in raw:
         if not isinstance(entry, dict) or not str(entry.get("telegram_id", "")).strip():
             raise ValueError("each approver needs a telegram_id")
         tid = str(entry["telegram_id"]).strip()
-        if not tid.lstrip("-").isdigit():
-            raise ValueError(f"telegram_id {tid!r} is not a numeric Telegram user id")
+        if not tid.isdigit() or int(tid) <= 0:
+            raise ValueError(f"telegram_id {tid!r} is not a positive numeric Telegram user id")
         if tid in seen:
             raise ValueError(f"approver telegram_id {tid} listed twice")
         seen.add(tid)
-        aliases = tuple(str(a).strip() for a in entry.get("aliases") or [] if ":" in str(a))
+        aliases = tuple(_alias(a) for a in entry.get("aliases") or [])
+        for key in (f"telegram:{tid}", *aliases):
+            if key in seen_keys:
+                raise ValueError(f"identity {key} is listed for two approvers")
+            seen_keys.add(key)
         approvers.append(Approver(name=str(entry.get("name") or tid), telegram_id=tid, aliases=aliases))
     patterns = tuple(str(p) for p in cfg.get("critical_patterns") or [])
     for p in patterns:
-        re.compile(p)
+        re.compile(p, re.IGNORECASE)
     return Policy(
         approvers=tuple(approvers),
         required=_positive_int(cfg.get("required", 1), "required"),
@@ -172,6 +177,14 @@ def parse_policy(cfg: dict) -> Policy:
         unknown_requester_required=_positive_int(cfg.get("unknown_requester_required", 2),
                                                  "unknown_requester_required"),
     )
+
+
+def _alias(value) -> str:
+    text = str(value).strip()
+    platform, sep, user_id = text.partition(":")
+    if not sep or not platform.strip() or not user_id.strip():
+        raise ValueError(f"alias {text!r} must look like platform:user_id")
+    return f"{platform.strip().lower()}:{user_id.strip()}"
 
 
 def _positive_int(value, name: str) -> int:
@@ -192,7 +205,7 @@ def roster_ids(policy: Policy) -> frozenset[str]:
 
 
 def is_on_roster(policy: Policy, platform: str, user_id: str) -> bool:
-    return bool(platform and user_id) and f"{platform}:{user_id}" in roster_ids(policy)
+    return bool(platform and user_id) and f"{platform.lower()}:{user_id}" in roster_ids(policy)
 
 
 def describe(policy: Policy) -> Iterable[str]:

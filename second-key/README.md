@@ -5,8 +5,8 @@ A two-person rule for shared Hermes bots.
 When Hermes wants to run a dangerous command, second-key sends the approval to the people on your roster by Telegram DM. The person whose message started the turn can never approve it. Critical commands need two approvals. If nobody answers, or something breaks, the command does not run.
 
 ```
-Priya (in the team group):  @hermes clean up the old build volumes
-Hermes:                     needs approval to run  rm -rf /srv/builds/2024-*
+Priya (in the team group):  @hermes tear down the staging stack
+Hermes:                     needs approval to run  terraform destroy -auto-approve
 Priya taps Approve:         "Not counted: you cannot vote on this request."
 Dev gets a DM, taps Approve once
 Hermes runs the command, once.
@@ -26,7 +26,7 @@ second-key reverses that. The requester is excluded, a quorum of other people de
 
 ## How it works
 
-1. `pre_approval_request` runs on the agent's own thread, where the turn's sender is bound. second-key records the sender's platform and user id against the request id.
+1. `pre_approval_request` runs on the agent's own thread, where the turn's sender is bound. second-key records the sender (`HERMES_SESSION_ACTOR_ID`, which is set in shared group chats too) against the request id.
 2. Hermes hands the redacted request to the `secondkey` approval transport on a worker thread. second-key works out how many approvals it needs and who is eligible: the roster minus the requester.
 3. Each eligible approver gets a DM with the command, the reason Hermes gave, who asked, and **Approve once** / **Deny** buttons.
 4. A vote counts only when Telegram reports it came from an eligible approver. One deny closes the request. Enough yes votes close it as approved.
@@ -38,9 +38,19 @@ Rules that decide the number of approvals, largest wins:
 - `critical_required` (default 2) when the command matches one of `critical_patterns`
 - `unknown_requester_required` (default 2) when the turn carries no sender id, for example a cron job or a local session
 
-If the roster has fewer eligible people than the request needs, second-key denies at once and DMs nobody.
+second-key denies at once, and DMs nobody, when:
 
-`/yolo` turns approvals off entirely, so second-key drops `/yolo` from anyone who is not on the roster before it reaches the agent.
+- the roster has fewer eligible people than the request needs
+- a chat turn carries no sender id, or the sender is Telegram's anonymous group admin
+- the command is longer than 3,000 characters, so approvers could not read all of it in one message
+
+## What it guards
+
+- **Commands:** dangerous terminal commands and `execute_code` scripts that Hermes sends to its approval transport.
+- **Chat commands:** `/yolo` and `/approvals` switch approvals off or down for the whole profile, so second-key drops them from every chat before they reach Hermes. The profile owner changes them from the local CLI.
+- **The agent editing its own guard:** a `pre_tool_call` hook refuses terminal, `execute_code` and file-write calls that touch `hermes config`, `hermes plugins`, `config.yaml`, the profile `.env` or second-key's settings, and file writes under `~/.ssh`.
+
+Hermes asks for some other approvals (protected file writes, computer use, MCP elicitation) on its own chat prompts, which do not go through approval transports. `/secondkey` checks whether second-key is actually armed: selected as the transport, no builtin fallback, and `approvals.mode` not `off` or `smart`.
 
 ## Setup
 
@@ -63,25 +73,25 @@ If the roster has fewer eligible people than the request needs, second-key denie
              - { name: Sam,   telegram_id: "333333333" }
            required: 1
            critical_required: 2
-           critical_patterns: ['rm\s+-rf', 'DROP\s+TABLE', 'terraform\s+destroy']
+           critical_patterns: ['rm\s+-\w*(rf|fr)', 'rm\s+-r\s+-f', 'rm\s+-f\s+-r', 'drop\s+(table|database)', 'terraform\s+destroy']
            unknown_requester_required: 2
    security:
      approval:
        transport: secondkey
    ```
-   `aliases` lists the same person's ids on other chat platforms, so a request Priya starts from Discord is still hers.
-5. Check it: `/secondkey` shows the policy and whether the token is set. `/secondkey ledger 20` shows recent decisions and whether the ledger chain is intact.
+   `aliases` lists the same person's ids on other chat platforms, so a request Priya starts from Discord is still hers. Critical patterns match case-insensitively.
+5. Check it: `/secondkey` shows whether second-key is armed, the policy, and whether the token is set. `/secondkey ledger 20` shows recent decisions and whether the ledger chain is intact.
 
 ## The ledger
 
-Every presentation, vote, refusal and decision is appended to `plugin-data/second-key/ledger.jsonl` in your Hermes home. Each line stores the SHA-256 of the line before it, so editing or deleting an earlier entry breaks the chain and `/secondkey ledger` reports the first broken line.
+Every presentation, vote, refusal, refused chat command, refused tool call and decision is appended to `plugin-data/second-key/ledger.jsonl` in your Hermes home. Each line stores the SHA-256 of the line before it, so editing or deleting an entry before the last one breaks the chain and `/secondkey ledger` reports the first broken line.
 
 ## What it touches
 
 - **Network:** `api.telegram.org` only, with the bot token from `SECONDKEY_TELEGRAM_BOT_TOKEN`. Redirects are refused.
 - **What approvers see:** the command after Hermes' own redaction, Hermes' reason for asking, and the requester's display name and platform.
 - **Background thread:** one long-poll thread reads the bot's updates. It starts on the first approval or `/start` and runs until Hermes exits.
-- **Files:** writes only its ledger under `plugin-data/second-key/`.
+- **Files:** writes only its ledger under `plugin-data/second-key/`. Reads Hermes' `config.yaml` (read-only) for the `/secondkey` arming check.
 - **Credentials:** reads the bot token through `agent.secret_scope.get_secret`. It never reads `.env`, `auth.json` or any other credential store.
 - **No telemetry, no self-updater, no shell commands, no dependencies beyond the standard library.**
 
@@ -91,7 +101,7 @@ Every presentation, vote, refusal and decision is appended to `plugin-data/secon
 python -m unittest discover -s tests -t . -v
 ```
 
-The suite drives the plugin through Hermes' real `ApprovalRequest` and `invoke_approval_transport` against a local Telegram Bot API server. It covers:
+The suite drives the plugin through Hermes' real `ApprovalRequest`, `invoke_approval_transport`, `set_session_vars` and `MessageEvent` parser, against a local Telegram Bot API server. It covers:
 
 - the requester tapping Approve (denied on timeout)
 - another approver approving
@@ -100,5 +110,8 @@ The suite drives the plugin through Hermes' real `ApprovalRequest` and `invoke_a
 - a critical command with two yes votes (approved)
 - too few eligible approvers (denied, no DM sent)
 - ledger tampering (chain reported broken)
+- shared-group turns where only the actor id is set
+- `/approvals off`, `/yolo` from an approver, and `/yolo` behind an attachment line
+- the agent running `hermes config set approvals.mode off` or writing `config.yaml` or `~/.ssh/config`
 
 Each guard was checked by breaking it and watching its test fail.
