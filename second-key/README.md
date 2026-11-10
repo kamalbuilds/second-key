@@ -13,6 +13,19 @@ Sam taps Approve once:      "Approved. The command can run once."
 Hermes runs the command, once.
 ```
 
+## The Approvals pane
+
+Hermes Desktop gets an Approvals pane and page, read live from the plugin's own state:
+
+- **Open ballots** with a countdown ring, the command, the risk tier, and an initial for every approver that lights up as their vote lands. The requester's initial is struck through, and a tap from someone who may not vote shows as Not counted.
+- **Armed or tripped.** Every setting that decides approvals is listed. Change one and the pane flips to TRIPPED within a second, showing the armed value and the new one.
+- **Sized to the risk.** The votes each tier needs, as M of N pips.
+- **The ledger as a hash chain.** Each decision is a block sealed with the hash of the one before it. A link that does not verify turns red at the entry that broke it.
+
+![Approvals pane: the agent edited its own command_allowlist and the pane shows TRIPPED](../docs/approvals-pane.png)
+
+Turn on Second key under Capabilities, Plugins. Approvals appears in the sidebar, in the pane dock and in the command palette. The pane reads `state.json`, `armed.json`, `ledger.jsonl` and `config.yaml` through read-only routes at `/api/plugins/second-key/state`.
+
 ## Why
 
 Hermes asks before it runs a flagged command. In a group chat, the person who asked is usually the one who answers. Core's `approvals.approvers` setting decides who else may answer, and the requester can always answer their own request.

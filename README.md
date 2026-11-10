@@ -6,6 +6,16 @@ Team approvals for shared Hermes bots: dangerous commands need N votes from your
 
 Interactive version: [docs/architecture.html](docs/architecture.html).
 
+## The Approvals pane
+
+A multisig for your AI agent: M of N teammates sized to the risk, the requester can't sign, and the agent can't change the signers. Hermes Desktop shows it live as an Approvals pane and page: a countdown ring and approver initials for every open ballot, the armed settings with a TRIPPED state the moment one changes, and the ledger as a chain of hash-linked blocks.
+
+![Approvals pane in Hermes Desktop: the agent edited command_allowlist in its own config, the pane shows TRIPPED with the setting that changed, the votes each risk tier needs, and the intact hash-chained ledger](docs/approvals-pane.png)
+
+An open ballot for `rm -r /srv/builds/staging`: the requester's initial is struck through, Kaveri's is waiting, and the ring counts down to deny.
+
+![Approvals pane with an open ballot: countdown ring, the command, the requester struck out and the approver waiting](docs/approvals-pane-ballot.png)
+
 ## What it does
 
 - Takes over Hermes' approval step with a transport named `secondkey`, so every flagged `terminal` command and `execute_code` script becomes a ballot.

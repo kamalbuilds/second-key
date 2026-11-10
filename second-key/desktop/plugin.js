@@ -112,10 +112,11 @@ const STYLE = `
 .sk-reasons{margin:0 16px 8px;padding:9px 12px;border-radius:9px;background:color-mix(in srgb,var(--ui-red) 12%,transparent);border:1px solid color-mix(in srgb,var(--ui-red) 40%,transparent);color:var(--ui-text-primary);font-size:12px}
 .sk-set{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;margin:0 10px 12px;padding:0;list-style:none}
 .sk-set li{display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:3px 8px;border-radius:7px;font-size:11.5px;min-width:0}
-.sk-set li[data-changed="true"]{background:color-mix(in srgb,var(--ui-red) 16%,transparent);color:var(--ui-red)}
+.sk-set li[data-changed="true"]{grid-column:1/-1;background:color-mix(in srgb,var(--ui-red) 16%,transparent);color:var(--ui-red)}
 .sk-set span{color:var(--ui-text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sk-set b{font-weight:560;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52%}
 .sk-set li[data-changed="true"] span{color:inherit}
+.sk-set li[data-changed="true"] b{max-width:none}
 .sk-list{list-style:none;margin:0;padding:0 8px 10px;display:flex;flex-direction:column;gap:2px}
 .sk-dec{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:center;padding:8px;border-radius:10px;font-size:12.5px}
 .sk-dec:hover{background:var(--ui-row-hover-background)}
@@ -330,7 +331,7 @@ function Gate({ armed }) {
       h('div', null, h('div', { className: 'sk-gate-t', style: { color: tone(t) } }, headline), h('div', { className: 'sk-gate-d' }, detail))),
     reasons.length > 0 && h('div', { className: 'sk-reasons', role: 'alert' }, reasons.map((r, i) => h('div', { key: i }, clip(r, 120)))),
     h('ul', { className: 'sk-set sk-mono' }, list(armed.watched).map(w => h('li', { key: w.key, 'data-changed': !!w.changed },
-      h('span', null, clip(w.key, 26)), h('b', null, w.changed && w.now ? `${clip(w.value, 10)} \u2192 ${clip(w.now, 14)}` : clip(w.value, 22))))))
+      h('span', null, clip(w.key, 26)), h('b', null, w.changed && w.now ? `${clip(w.value, 16)} \u2192 ${clip(w.now, 44)}` : clip(w.value, 22))))))
 }
 
 const TIER_NAME = { standard: 'Ordinary command', critical: 'Critical command', unknown: 'Requester unknown' }
