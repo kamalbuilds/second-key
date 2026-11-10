@@ -460,3 +460,8 @@ class AnchorTests(Base):
             time.sleep(0.05)
         decided = [e for e in plugin._get_ledger().entries() if e["event"] == "decided"][-1]
         self.assertTrue(all(f"ledger {decided['hash'][:16]}" in text for text in client.closed))
+
+    def test_tap_on_a_closed_ballot_is_recorded(self):
+        self.assertEqual(plugin._on_vote("no-such-request", "333", "once"), "unknown")
+        late = [e for e in plugin._get_ledger().entries() if e["event"] == "vote"][-1]
+        self.assertEqual((late["request_id"], late["voter"], late["result"]), ("no-such-request", "333", "unknown"))

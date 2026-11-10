@@ -299,6 +299,8 @@ def _on_vote(request_id: str, voter: str, choice: str) -> str:
     with _state_lock:
         ballot = _ballots.get(request_id)
     if ballot is None:
+        # Closed, timed out or never ours: still record the tap so a late or stray vote is visible.
+        _record("vote", request_id=request_id, voter=voter, choice=choice, result="unknown")
         return "unknown"
     result = ballot.vote(voter, choice)
     _record("vote", request_id=request_id, voter=voter, choice=choice, result=result)
