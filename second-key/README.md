@@ -93,7 +93,7 @@ hermes plugins install kamalbuilds/second-key/second-key --enable
 
 ## The ledger
 
-Every presentation, vote, refusal, refused chat command, refused tool call and decision is appended to `plugin-data/second-key/ledger.jsonl` in your Hermes home. Each line stores the SHA-256 of the line before it, so editing or deleting an entry before the last one breaks the chain and `/secondkey ledger` reports the first broken line. The outside anchor is the hash in each approver's closing DM: it carries the first 16 characters of its decision's hash, which covers that decision and every entry before it, so each approver holds a copy of the record on a machine that is not running Hermes. `/secondkey ledger` prints the same 16 characters on every line to compare against. A decision whose record cannot be written is denied, and the failure is logged at error level.
+Every presentation, vote, refusal, refused chat command, refused tool call and decision is appended to `plugin-data/second-key/ledger.jsonl` in your Hermes home. Each line stores the SHA-256 of the line before it, so editing or deleting an entry before the last one breaks the chain and `/secondkey ledger` reports the first broken line. Each approver's closing DM is a receipt they keep: it carries the first 16 characters of its decision's hash, which covers that decision and every entry before it. `/secondkey ledger` prints the same 16 characters on every line, so an approver can hold their receipt up against the record. A decision whose record cannot be written is denied, and the failure is logged at error level.
 
 ## What it touches
 
