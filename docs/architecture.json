@@ -1,0 +1,233 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "second-key: a two-person rule for dangerous commands",
+    "output": "docs/architecture.html",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "hermes",
+      "label": "Hermes host"
+    },
+    {
+      "id": "plugin",
+      "label": "second-key plugin"
+    },
+    {
+      "id": "telegram",
+      "label": "Telegram"
+    }
+  ],
+  "phases": [
+    {
+      "id": "flag",
+      "label": "Flag",
+      "fromCol": 0,
+      "toCol": 2
+    },
+    {
+      "id": "vote",
+      "label": "Quorum + vote",
+      "fromCol": 3,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "decide",
+      "label": "Record + enforce",
+      "fromCol": 5,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "mainPath": [
+    "tool",
+    "gate",
+    "bind",
+    "quorum",
+    "dms",
+    "decide",
+    "outcome"
+  ],
+  "nodes": [
+    {
+      "id": "tool",
+      "lane": "hermes",
+      "col": 0,
+      "type": "backend",
+      "label": "Agent tool call",
+      "sublabel": "terminal / execute_code",
+      "width": 132
+    },
+    {
+      "id": "gate",
+      "lane": "hermes",
+      "col": 1,
+      "type": "backend",
+      "label": "Approval gate",
+      "sublabel": "flags dangerous command",
+      "width": 132
+    },
+    {
+      "id": "outcome",
+      "lane": "hermes",
+      "col": 5,
+      "type": "backend",
+      "label": "Runs once or refuses",
+      "sublabel": "Hermes enforces the answer",
+      "width": 132
+    },
+    {
+      "id": "tripwire",
+      "lane": "plugin",
+      "col": 1,
+      "type": "security",
+      "label": "Settings tripwire",
+      "sublabel": "pre_tool_call vs armed.json",
+      "width": 132,
+      "tag": "blocks tools on drift"
+    },
+    {
+      "id": "bind",
+      "lane": "plugin",
+      "col": 2,
+      "type": "security",
+      "label": "Bind requester",
+      "sublabel": "pre_approval_request",
+      "width": 132
+    },
+    {
+      "id": "quorum",
+      "lane": "plugin",
+      "col": 3,
+      "type": "security",
+      "label": "Quorum",
+      "sublabel": "requester excluded",
+      "tag": "critical needs 2",
+      "width": 132
+    },
+    {
+      "id": "decide",
+      "lane": "plugin",
+      "col": 4,
+      "type": "security",
+      "label": "Decision",
+      "sublabel": "once or deny",
+      "width": 132
+    },
+    {
+      "id": "dms",
+      "lane": "telegram",
+      "col": 4,
+      "type": "cloud",
+      "label": "Approver DMs",
+      "sublabel": "Approve once / Deny",
+      "width": 132
+    },
+    {
+      "id": "ledger",
+      "lane": "plugin",
+      "col": 5,
+      "type": "database",
+      "label": "Hash-chained ledger",
+      "sublabel": "plugin-data/ledger.jsonl",
+      "width": 132
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-flag",
+      "from": "tool",
+      "to": "gate",
+      "label": "flagged command",
+      "variant": "default"
+    },
+    {
+      "id": "e-trip",
+      "from": "tool",
+      "to": "tripwire",
+      "label": "pre_tool_call",
+      "variant": "security"
+    },
+    {
+      "id": "e-bind",
+      "from": "gate",
+      "to": "bind",
+      "label": "transport",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-quorum",
+      "from": "bind",
+      "to": "quorum",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-dm",
+      "from": "quorum",
+      "to": "dms",
+      "label": "ballot",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-vote",
+      "from": "dms",
+      "to": "decide",
+      "label": "votes",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-answer",
+      "from": "decide",
+      "to": "outcome",
+      "label": "once or deny",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-ledger",
+      "from": "decide",
+      "to": "ledger",
+      "label": "append",
+      "variant": "security"
+    },
+    {
+      "id": "e-close",
+      "from": "ledger",
+      "to": "dms",
+      "label": "hash in closing DM",
+      "variant": "dashed",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Requester excluded",
+      "items": [
+        "Bound on the agent thread by pre_approval_request",
+        "Eligible approvers are the roster minus the requester",
+        "rm -rf, terraform destroy and similar need 2 yes votes"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "Fails closed",
+      "items": [
+        "Silence, errors and too few approvers deny",
+        "Only once or deny ever returns to Hermes",
+        "Tools stop when approval settings drift from armed.json"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Hash-chained record",
+      "items": [
+        "Presentations, votes and decisions are appended",
+        "Each line carries the SHA-256 of the line before it",
+        "Approvers keep the first 16 hash characters"
+      ]
+    }
+  ]
+}
