@@ -33,6 +33,7 @@ _GATED_TOKEN = re.compile(r"(^|\s)/(yolo|approvals)\b", re.IGNORECASE)
 TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person  # an approval is presented within seconds of its hook; stale bindings expire
 
 _ctx: Any = None
+_home: str | None = None  # profile home at load time; see _in_profile_home
 _bindings: dict[str, tuple[quorum.Requester, str, float]] = {}
 _ballots: dict[str, quorum.Ballot] = {}
 _state_lock = threading.Lock()
@@ -316,6 +317,24 @@ def _on_start(user_id: str, chat_id: str) -> None:
 # ---------------------------------------------------------------- transport
 
 def present(request) -> Any:
+    return _in_profile_home(_present, request)
+
+
+def _in_profile_home(fn, *args):
+    """Run ``fn`` under the profile second-key was loaded in. Hermes runs ``present`` on a fresh
+    worker thread, which does not inherit the session's Hermes home override, so config reads there
+    would otherwise land on the default profile and find no roster."""
+    from hermes_constants import get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override
+    if not _home or get_hermes_home_override() == _home:
+        return fn(*args)
+    token = set_hermes_home_override(_home)
+    try:
+        return fn(*args)
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _present(request) -> Any:
     """Hermes calls this on a worker thread with a redacted, immutable ApprovalRequest. It returns
     ``once`` only when the quorum is met by people other than the requester; anything else is deny."""
     with _state_lock:
@@ -486,8 +505,10 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
 
 
 def register(ctx) -> None:
-    global _ctx
+    global _ctx, _home
+    from hermes_constants import get_hermes_home
     _ctx = ctx
+    _home = str(get_hermes_home())
     ctx.register_hook("pre_approval_request", _on_pre_approval_request)
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)

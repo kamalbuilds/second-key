@@ -2,6 +2,7 @@
 import importlib.util
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -208,6 +209,50 @@ class TripwireTests(unittest.TestCase):
         self.edit("mode: off", "mode: manual")
         self.assertIn("armed", plugin._cmd_secondkey("arm", platform="cli"))
         self.assertIsNone(self.tool())
+
+
+class ProfileHomeTests(unittest.TestCase):
+    """Hermes calls present() on a bare worker thread: the session's home override is not there."""
+
+    def setUp(self):
+        import os
+        self.temp = tempfile.TemporaryDirectory()
+        self.profile = Path(self.temp.name) / "profile"
+        self.default = Path(self.temp.name) / "default"
+        self.profile.mkdir()
+        self.default.mkdir()
+        (self.profile / "config.yaml").write_text(ARMED_CFG)
+        (self.default / "config.yaml").write_text("approvals:\n  mode: manual\n")
+        self.env = patch.dict(os.environ, {"HERMES_HOME": str(self.default)})
+        self.env.start()
+        self.saved = (plugin._ctx, plugin._home, plugin._present)
+        plugin._ctx = _Ctx(self.profile)
+
+    def tearDown(self):
+        plugin._ctx, plugin._home, plugin._present = self.saved
+        self.env.stop()
+        self.temp.cleanup()
+
+    def on_bare_thread(self, fn):
+        out = []
+        worker = threading.Thread(target=lambda: out.append(fn()))
+        worker.start()
+        worker.join(5)
+        return out[0]
+
+    def test_present_reads_the_roster_of_the_profile_it_was_loaded_in(self):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(str(self.profile))
+        try:
+            plugin._home = None
+            from hermes_constants import get_hermes_home
+            plugin._home = str(get_hermes_home())  # what register() records
+        finally:
+            reset_hermes_home_override(token)
+        plugin._present = lambda request: len(plugin._policy().approvers)
+        self.assertEqual(self.on_bare_thread(lambda: plugin.present(None)), 1)
+        self.assertEqual(self.on_bare_thread(lambda: len(plugin._policy().approvers)), 0,
+                         "fixture is not reproducing the bare-thread default home")
 
 
 class _AlertClient:
