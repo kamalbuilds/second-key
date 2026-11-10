@@ -58,6 +58,7 @@ def _armed(data: Path, state: dict) -> dict:
     view = armed.get("view") if armed.get("fingerprint") == tripwire.fingerprint(armed.get("view") or {}) else None
     reasons = list(state.get("tripped") or [])
     changed: set = set()
+    current: dict = {}
     if view is not None:
         try:
             from hermes_cli.config import load_config_readonly
@@ -72,7 +73,7 @@ def _armed(data: Path, state: dict) -> dict:
         "state": "tripped" if reasons else "armed" if view is not None else "not armed",
         "reasons": reasons,
         "fingerprint": tripwire.fingerprint(view)[:16] if view is not None else "",
-        "watched": [{"key": k, "value": _short(v), "changed": k in changed}
+        "watched": [{"key": k, "value": _short(v), "changed": k in changed, "now": _short(current.get(k)) if k in changed else ""}
                     for k, v in sorted(shown.items()) if k not in HIDDEN_VIEW_KEYS],
     }
 

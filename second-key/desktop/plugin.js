@@ -4,7 +4,7 @@ import { PANES_AREA, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA, host, relative
 const POLL_MS = 1000
 const TICK_MS = 250
 const FRESH_MS = 3200
-const SIZE = 260
+const SIZE = 236
 const MID = SIZE / 2
 const TAU = Math.PI * 2
 
@@ -51,7 +51,7 @@ const STYLE = `
 .sk-ringbox{position:relative;width:min(100%,${SIZE}px);aspect-ratio:1;margin:0 auto}
 .sk-ring{display:block;width:100%;height:100%;overflow:visible}
 .sk-ring-c{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;text-align:center}
-.sk-time{font-size:46px;font-weight:680;letter-spacing:-.03em;line-height:1}
+.sk-time{font-size:42px;font-weight:680;letter-spacing:-.03em;line-height:1}
 .sk-time-l{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--ui-text-tertiary)}
 .sk-tally{margin-top:8px;font-size:15px;font-weight:620}
 .sk-tally b{font-size:22px}
@@ -93,7 +93,7 @@ const STYLE = `
 .sk-nc-i svg{width:16px;height:16px;flex:none;color:var(--ui-red)}
 .sk-nc-i b{font-weight:680}
 .sk-nc-i em{font-style:normal;margin-left:auto;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ui-red);font-weight:700;white-space:nowrap}
-.sk-tiers{list-style:none;margin:0;padding:2px 16px 14px;display:flex;flex-direction:column;gap:9px}
+.sk-tiers{list-style:none;margin:0;padding:2px 16px 14px;display:flex;flex-direction:column;gap:11px}
 .sk-tier{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
 .sk-tier-n{font-size:12.5px;color:var(--ui-text-secondary)}
 .sk-tier-n b{color:var(--ui-text-primary);font-weight:620}
@@ -102,7 +102,6 @@ const STYLE = `
 .sk-pip{width:20px;height:8px;border-radius:3px;background:var(--ui-stroke-secondary)}
 .sk-pip[data-on="true"]{background:var(--ui-accent)}
 .sk-tier[data-tier="critical"] .sk-pip[data-on="true"]{background:var(--ui-red);box-shadow:0 0 8px -1px var(--ui-red)}
-.sk-tier-m{grid-column:1/-1;font-size:11px;color:var(--ui-text-tertiary)}
 .sk-idle{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;padding:12px 18px 18px;align-items:center}
 .sk-idle h3{margin:0 0 6px;font-size:20px;font-weight:660;letter-spacing:-.01em}
 .sk-idle p{margin:0;color:var(--ui-text-secondary);max-width:58ch}
@@ -112,7 +111,7 @@ const STYLE = `
 .sk-gate-d{font-size:12px;color:var(--ui-text-secondary)}
 .sk-reasons{margin:0 16px 8px;padding:9px 12px;border-radius:9px;background:color-mix(in srgb,var(--ui-red) 12%,transparent);border:1px solid color-mix(in srgb,var(--ui-red) 40%,transparent);color:var(--ui-text-primary);font-size:12px}
 .sk-set{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;margin:0 10px 12px;padding:0;list-style:none}
-.sk-set li{display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:5px 8px;border-radius:7px;font-size:11.5px;min-width:0}
+.sk-set li{display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:3px 8px;border-radius:7px;font-size:11.5px;min-width:0}
 .sk-set li[data-changed="true"]{background:color-mix(in srgb,var(--ui-red) 16%,transparent);color:var(--ui-red)}
 .sk-set span{color:var(--ui-text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sk-set b{font-weight:560;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52%}
@@ -224,17 +223,17 @@ function useClock(ctx) {
 }
 
 function Ring({ frac, label, required, yes, danger }) {
-  const radius = 108
+  const radius = 98
   const circ = TAU * radius
   const color = danger ? 'var(--ui-red)' : frac > 0.5 ? 'var(--ui-accent)' : frac > 0.2 ? 'var(--ui-yellow)' : 'var(--ui-red)'
   const ticks = []
   for (let i = 0; i < 60; i++) {
     const a = (i / 60) * TAU - Math.PI / 2
     const long = i % 5 === 0
-    const r0 = long ? 119 : 122
+    const r0 = long ? 108 : 111
     const lit = i / 60 < frac
     ticks.push(h('line', {
-      key: i, x1: MID + r0 * Math.cos(a), y1: MID + r0 * Math.sin(a), x2: MID + 127 * Math.cos(a), y2: MID + 127 * Math.sin(a),
+      key: i, x1: MID + r0 * Math.cos(a), y1: MID + r0 * Math.sin(a), x2: MID + 116 * Math.cos(a), y2: MID + 116 * Math.sin(a),
       stroke: lit ? color : 'var(--ui-stroke-secondary)', strokeWidth: long ? 2.2 : 1.2, strokeLinecap: 'round'
     }))
   }
@@ -245,7 +244,7 @@ function Ring({ frac, label, required, yes, danger }) {
     const a1 = -Math.PI / 2 + ((i + 1) / required) * TAU - gap / 2
     const got = i < yes
     segs.push(h('path', {
-      key: i, d: pathArc(86, a0, a1), fill: 'none', strokeWidth: 9, strokeLinecap: 'round',
+      key: i, d: pathArc(77, a0, a1), fill: 'none', strokeWidth: 9, strokeLinecap: 'round',
       stroke: got ? 'var(--ui-green)' : 'var(--ui-stroke-secondary)',
       style: got ? { filter: 'drop-shadow(0 0 7px var(--ui-green))', transition: 'stroke .4s' } : { transition: 'stroke .4s' }
     }))
@@ -331,7 +330,7 @@ function Gate({ armed }) {
       h('div', null, h('div', { className: 'sk-gate-t', style: { color: tone(t) } }, headline), h('div', { className: 'sk-gate-d' }, detail))),
     reasons.length > 0 && h('div', { className: 'sk-reasons', role: 'alert' }, reasons.map((r, i) => h('div', { key: i }, clip(r, 120)))),
     h('ul', { className: 'sk-set sk-mono' }, list(armed.watched).map(w => h('li', { key: w.key, 'data-changed': !!w.changed },
-      h('span', null, clip(w.key, 26)), h('b', null, clip(w.value, 22))))))
+      h('span', null, clip(w.key, 26)), h('b', null, w.changed && w.now ? `${clip(w.value, 10)} \u2192 ${clip(w.now, 14)}` : clip(w.value, 22))))))
 }
 
 const TIER_NAME = { standard: 'Ordinary command', critical: 'Critical command', unknown: 'Requester unknown' }
@@ -345,11 +344,11 @@ function Tiers({ tiers, roster }) {
     h('div', { className: 'sk-card-h' }, h('span', null, 'Sized to the risk'), h('span', { className: 'sk-num' }, `${n} on the roster`)),
     h('ul', { className: 'sk-tiers' }, rows.map(t => {
       const need = Math.min(Math.max(num(t.required, 1), 1), n)
-      return h('li', { key: t.tier, className: 'sk-tier', 'data-tier': t.tier },
+      return h('li', { key: t.tier, className: 'sk-tier', 'data-tier': t.tier, title: TIER_NOTE[t.tier] || undefined },
         h('span', { className: 'sk-tier-n' }, h('b', null, TIER_NAME[t.tier] || clip(t.tier, 20)), ` needs ${num(t.required, 1)} of ${n}`),
         h('span', { className: 'sk-pips', role: 'img', 'aria-label': `${num(t.required, 1)} of ${n} approvals` },
           Array.from({ length: Math.min(n, 12) }, (_, i) => h('i', { key: i, className: 'sk-pip', 'data-on': i < need }))),
-        h('span', { className: 'sk-tier-m' }, TIER_NOTE[t.tier] || ''))
+        )
     })))
 }
 
@@ -431,8 +430,9 @@ function Approvals({ ctx }) {
         h('div', { className: 'sk-col' },
           ballots.length
             ? ballots.map(b => h(Ballot, { key: b.request_id, ballot: b, now, fetchedAt: snap.at, serverNow: num(data.now) * 1000 }))
-            : h(Idle, { roster: data.roster, last: list(data.recent)[0] })),
-        h('div', { className: 'sk-col' }, h(Gate, { armed }), h(Tiers, { tiers: data.tiers, roster: data.roster }), h(Decisions, { recent: data.recent }))),
+            : h(Idle, { roster: data.roster, last: list(data.recent)[0] }),
+          h(Decisions, { recent: data.recent })),
+        h('div', { className: 'sk-col' }, h(Gate, { armed }), h(Tiers, { tiers: data.tiers, roster: data.roster }))),
       h(Chain, { ledger: data.ledger || {}, fresh })))
 }
 
