@@ -211,48 +211,79 @@ class TripwireTests(unittest.TestCase):
         self.assertIsNone(self.tool())
 
 
-class ProfileHomeTests(unittest.TestCase):
-    """Hermes calls present() on a bare worker thread: the session's home override is not there."""
+class WorkerThreadContextTests(unittest.TestCase):
+    """The multiplexed gateway binds the profile's Hermes home and secret scope on the session
+    thread only. Hermes then runs present() on a bare thread, which has neither."""
 
     def setUp(self):
         import os
+        from agent.secret_scope import set_multiplex_active
         self.temp = tempfile.TemporaryDirectory()
         self.profile = Path(self.temp.name) / "profile"
         self.default = Path(self.temp.name) / "default"
         self.profile.mkdir()
         self.default.mkdir()
-        (self.profile / "config.yaml").write_text(ARMED_CFG)
+        (self.profile / "config.yaml").write_text(
+            ARMED_CFG + '          - {name: Sam, telegram_id: "333"}\n'
+            "        required: 1\n        critical_required: 2\n        critical_patterns: ['rm\\s+-rf']\n")
         (self.default / "config.yaml").write_text("approvals:\n  mode: manual\n")
         self.env = patch.dict(os.environ, {"HERMES_HOME": str(self.default)})
         self.env.start()
-        self.saved = (plugin._ctx, plugin._home, plugin._present)
+        set_multiplex_active(True)
+        self.saved = (plugin._ctx, plugin._get_ledger, plugin._client, plugin._poller, plugin.BotClient, plugin.Poller)
         plugin._ctx = _Ctx(self.profile)
+        plugin._get_ledger = lambda: plugin.Ledger(Path(self.temp.name) / "ledger.jsonl")
+        plugin._client = plugin._poller = None
+        self.bots = []
+        test = self
+
+        class Bot:
+            def __init__(self, token):
+                self.token, self.sent = token, []
+                test.bots.append(self)
+
+            def send_ballot(self, chat_id, text, request_id):
+                self.sent.append(chat_id)
+                plugin._on_vote(request_id, chat_id, "once")
+                return 1
+
+            def close_ballot(self, *args):
+                pass
+
+        plugin.BotClient = Bot
+        plugin.Poller = lambda client, on_vote, on_start, wanted: SimpleNamespace(ensure_running=lambda: None)
 
     def tearDown(self):
-        plugin._ctx, plugin._home, plugin._present = self.saved
+        from agent.secret_scope import set_multiplex_active
+        (plugin._ctx, plugin._get_ledger, plugin._client, plugin._poller, plugin.BotClient, plugin.Poller) = self.saved
+        plugin._bindings.clear()
+        plugin._ballots.clear()
+        set_multiplex_active(False)
         self.env.stop()
         self.temp.cleanup()
 
-    def on_bare_thread(self, fn):
-        out = []
-        worker = threading.Thread(target=lambda: out.append(fn()))
-        worker.start()
-        worker.join(5)
-        return out[0]
-
-    def test_present_reads_the_roster_of_the_profile_it_was_loaded_in(self):
+    def test_present_on_a_bare_thread_reads_the_session_profile(self):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from hermes_cli.approval_transport import invoke_approval_transport
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        token = set_hermes_home_override(str(self.profile))
+        req = ApprovalRequest.create(command="rm -rf /srv/data", description="test", pattern_key="shell",
+                                     pattern_keys=("shell",), session_key="k", surface="gateway",
+                                     allow_session=False, allow_permanent=False, timeout_seconds=5)
+        home = set_hermes_home_override(str(self.profile))
+        scope = set_secret_scope({plugin.TOKEN_ENV: "123:profile-token"}, profile_home=str(self.profile))
+        tokens = set_session_vars(platform="local", user_id="uid:501")
         try:
-            plugin._home = None
-            from hermes_constants import get_hermes_home
-            plugin._home = str(get_hermes_home())  # what register() records
+            plugin._on_pre_approval_request(request_id=req.request_id)
+            result = invoke_approval_transport(plugin.present, req, timeout_seconds=10)
         finally:
-            reset_hermes_home_override(token)
-        plugin._present = lambda request: len(plugin._policy().approvers)
-        self.assertEqual(self.on_bare_thread(lambda: plugin.present(None)), 1)
-        self.assertEqual(self.on_bare_thread(lambda: len(plugin._policy().approvers)), 0,
-                         "fixture is not reproducing the bare-thread default home")
+            clear_session_vars(tokens)
+            reset_secret_scope(scope)
+            reset_hermes_home_override(home)
+        self.assertEqual((result.failure, result.choice), (None, "once"))
+        self.assertEqual(self.bots[0].token, "123:profile-token")
+        self.assertEqual(self.bots[0].sent, ["222", "333"], "roster from the profile config")
+        presented = [e for e in plugin._get_ledger().tail(10) if e["event"] == "presented"]
+        self.assertEqual(presented[0]["required"], 2, "critical_patterns from the profile config")
 
 
 class _AlertClient:

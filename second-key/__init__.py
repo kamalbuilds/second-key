@@ -9,6 +9,7 @@ enforces host-side. Chat commands and tool calls that would switch approvals off
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -24,17 +25,16 @@ logger = logging.getLogger(__name__)
 
 TRANSPORT = "secondkey"
 TOKEN_ENV = "SECONDKEY_TELEGRAM_BOT_TOKEN"
-_BINDING_TTL = 900.0
+_BINDING_TTL = 900.0  # an approval is presented within seconds of its hook; stale bindings expire
 MAX_COMMAND_CHARS = 3000  # Telegram messages cap at 4096; approvers must see the whole command
 _GATED_COMMANDS = frozenset({"yolo", "approvals"})
 # /loop, /queue, /bg, /steer and friends replay their argument later as an internal event, which
 # skips this hook, so a gated command inside any slash command is refused here.
 _GATED_TOKEN = re.compile(r"(^|\s)/(yolo|approvals)\b", re.IGNORECASE)
-TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person  # an approval is presented within seconds of its hook; stale bindings expire
+TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person
 
 _ctx: Any = None
-_home: str | None = None  # profile home at load time; see _in_profile_home
-_bindings: dict[str, tuple[quorum.Requester, str, float]] = {}
+_bindings: dict[str, tuple[quorum.Requester, str, float, contextvars.Context]] = {}
 _ballots: dict[str, quorum.Ballot] = {}
 _state_lock = threading.Lock()
 _client: BotClient | None = None
@@ -93,15 +93,16 @@ def _record(event: str, **fields) -> dict | None:
 
 
 def _expire_bindings(now: float) -> None:
-    for rid in [r for r, (_, _, t) in _bindings.items() if now - t > _BINDING_TTL]:
+    for rid in [r for r, b in _bindings.items() if now - b[2] > _BINDING_TTL]:
         _bindings.pop(rid, None)
 
 
 # ---------------------------------------------------------------- hooks
 
 def _on_pre_approval_request(request_id: str = "", **kwargs) -> None:
-    """Runs on the agent's own thread, where the turn's session identity is bound. The transport
-    worker that Hermes starts next is a fresh thread without it, so bind the requester here."""
+    """Runs on the agent's own thread, where the turn's session identity, Hermes home override and
+    profile secret scope are bound. The transport worker that Hermes starts next is a fresh thread
+    without any of them, so bind the requester here and keep a copy of this context for present()."""
     if not request_id:
         return
     # ACTOR_ID is the person whose message started this turn; in a shared (observe-mode) group
@@ -113,7 +114,7 @@ def _on_pre_approval_request(request_id: str = "", **kwargs) -> None:
     with _state_lock:
         now = time.monotonic()
         _expire_bindings(now)
-        _bindings[request_id] = (requester, name, now)
+        _bindings[request_id] = (requester, name, now, contextvars.copy_context())
 
 
 def _command_of(event) -> str:
@@ -317,21 +318,14 @@ def _on_start(user_id: str, chat_id: str) -> None:
 # ---------------------------------------------------------------- transport
 
 def present(request) -> Any:
-    return _in_profile_home(_present, request)
-
-
-def _in_profile_home(fn, *args):
-    """Run ``fn`` under the profile second-key was loaded in. Hermes runs ``present`` on a fresh
-    worker thread, which does not inherit the session's Hermes home override, so config reads there
-    would otherwise land on the default profile and find no roster."""
-    from hermes_constants import get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override
-    if not _home or get_hermes_home_override() == _home:
-        return fn(*args)
-    token = set_hermes_home_override(_home)
-    try:
-        return fn(*args)
-    finally:
-        reset_hermes_home_override(token)
+    """Hermes runs this on a bare worker thread with none of the session's contextvars, so on a
+    multiplexed gateway config reads land on the default profile and the bot token read raises.
+    Run inside the context the pre_approval_request hook captured on the session thread."""
+    with _state_lock:
+        binding = _bindings.get(request.request_id)
+    if binding is None:
+        return _present(request)  # refuses: nobody can say who asked
+    return binding[3].run(_present, request)
 
 
 def _present(request) -> Any:
@@ -347,7 +341,7 @@ def _present(request) -> Any:
         # request reached us some other way, so nobody can say who asked: refuse.
         _record("refused", request_id=request.request_id, why="no requester binding for this request")
         return deny
-    requester, requester_name, _ = binding
+    requester, requester_name = binding[:2]
     if requester.platform and requester.platform != "local" and not requester.user_id:
         _record("refused", request_id=request.request_id, platform=requester.platform,
                 why="chat turn without a bound sender id")
@@ -505,10 +499,8 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
 
 
 def register(ctx) -> None:
-    global _ctx, _home
-    from hermes_constants import get_hermes_home
+    global _ctx
     _ctx = ctx
-    _home = str(get_hermes_home())
     ctx.register_hook("pre_approval_request", _on_pre_approval_request)
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
