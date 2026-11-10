@@ -82,15 +82,21 @@ def _short(value) -> str:
     return (text or "none")[:60]
 
 
-def _roster() -> list[dict]:
+def _policy() -> dict:
+    """The roster and the votes each risk tier needs, parsed from config.yaml by the same code that enforces them."""
     try:
         from hermes_cli.config import load_config_readonly
 
         entry = ((load_config_readonly() or {}).get("plugins") or {}).get("entries", {}).get("second-key") or {}
         policy = _sibling("quorum").parse_policy(entry.get("settings") if "settings" in entry else entry.get("config") or {})
     except (ValueError, TypeError, AttributeError):  # a bad roster shows as empty; /secondkey names the error
-        return []
-    return [{"name": a.name} for a in policy.approvers]
+        return {"roster": [], "tiers": []}
+    return {
+        "roster": [{"name": a.name} for a in policy.approvers],
+        "tiers": [{"tier": "standard", "required": policy.required},
+                  {"tier": "critical", "required": policy.critical_required},
+                  {"tier": "unknown", "required": policy.unknown_requester_required}],
+    }
 
 
 def _detail(entry: dict) -> str:
@@ -120,12 +126,14 @@ def state(ledger: int = Query(LEDGER_SHOWN, ge=1, le=60)):
     book = _sibling("ledger").Ledger(data / "ledger.jsonl")
     entries, flags = book.entries(), book.audit()
     first = max(0, len(entries) - ledger)
+    policy = _policy()
     return {
         "now": now,
         "ballots": _live_ballots(saved, now),
         "recent": list(reversed(saved.get("recent") or [])),
         "armed": _armed(data, saved),
-        "roster": _roster(),
+        "roster": policy["roster"],
+        "tiers": policy["tiers"],
         "ledger": {
             "total": len(entries), "ok": all(flags), "broken_at": flags.index(False) + 1 if not all(flags) else 0,
             "entries": [{"n": i + 1, "ts": e.get("ts", ""), "event": e.get("event", ""), "hash": e.get("hash", ""),

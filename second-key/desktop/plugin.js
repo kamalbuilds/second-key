@@ -29,7 +29,8 @@ const STYLE = `
 .sk-brand{display:flex;align-items:center;gap:12px;min-width:0}
 .sk-key{width:38px;height:38px;flex:none;color:var(--ui-accent)}
 .sk-title{font-size:22px;font-weight:680;letter-spacing:-.015em;line-height:1.1}
-.sk-tag{margin-top:3px;color:var(--ui-text-secondary);font-size:12.5px}
+.sk-tag{margin-top:4px;color:var(--ui-text-secondary);font-size:12.5px;max-width:64ch}
+.sk-tag b{color:var(--ui-text-primary);font-weight:620}
 .sk-pills{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .sk-pill{display:inline-flex;align-items:center;gap:7px;font-size:11px;font-weight:650;letter-spacing:.12em;text-transform:uppercase;padding:5px 11px;border-radius:999px;border:1px solid var(--ui-stroke-secondary);color:var(--ui-text-secondary);background:var(--ui-bg-secondary)}
 .sk-pill i{width:7px;height:7px;border-radius:50%;background:var(--ui-text-quaternary)}
@@ -92,6 +93,16 @@ const STYLE = `
 .sk-nc-i svg{width:16px;height:16px;flex:none;color:var(--ui-red)}
 .sk-nc-i b{font-weight:680}
 .sk-nc-i em{font-style:normal;margin-left:auto;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ui-red);font-weight:700;white-space:nowrap}
+.sk-tiers{list-style:none;margin:0;padding:2px 16px 14px;display:flex;flex-direction:column;gap:9px}
+.sk-tier{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
+.sk-tier-n{font-size:12.5px;color:var(--ui-text-secondary)}
+.sk-tier-n b{color:var(--ui-text-primary);font-weight:620}
+.sk-tier[data-tier="critical"] .sk-tier-n b{color:var(--ui-red)}
+.sk-pips{display:flex;gap:4px;justify-content:flex-end}
+.sk-pip{width:20px;height:8px;border-radius:3px;background:var(--ui-stroke-secondary)}
+.sk-pip[data-on="true"]{background:var(--ui-accent)}
+.sk-tier[data-tier="critical"] .sk-pip[data-on="true"]{background:var(--ui-red);box-shadow:0 0 8px -1px var(--ui-red)}
+.sk-tier-m{grid-column:1/-1;font-size:11px;color:var(--ui-text-tertiary)}
 .sk-idle{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;padding:12px 18px 18px;align-items:center}
 .sk-idle h3{margin:0 0 6px;font-size:20px;font-weight:660;letter-spacing:-.01em}
 .sk-idle p{margin:0;color:var(--ui-text-secondary);max-width:58ch}
@@ -323,6 +334,25 @@ function Gate({ armed }) {
       h('span', null, clip(w.key, 26)), h('b', null, clip(w.value, 22))))))
 }
 
+const TIER_NAME = { standard: 'Ordinary command', critical: 'Critical command', unknown: 'Requester unknown' }
+const TIER_NOTE = { standard: 'Flagged by Hermes', critical: 'rm -rf, drop table, destroy, force push', unknown: 'Local session no approver claims' }
+
+function Tiers({ tiers, roster }) {
+  const n = Math.max(list(roster).length, 1)
+  const rows = list(tiers)
+  if (!rows.length) return null
+  return h('section', { className: 'sk-card', 'aria-label': 'Votes needed by risk' },
+    h('div', { className: 'sk-card-h' }, h('span', null, 'Sized to the risk'), h('span', { className: 'sk-num' }, `${n} on the roster`)),
+    h('ul', { className: 'sk-tiers' }, rows.map(t => {
+      const need = Math.min(Math.max(num(t.required, 1), 1), n)
+      return h('li', { key: t.tier, className: 'sk-tier', 'data-tier': t.tier },
+        h('span', { className: 'sk-tier-n' }, h('b', null, TIER_NAME[t.tier] || clip(t.tier, 20)), ` needs ${num(t.required, 1)} of ${n}`),
+        h('span', { className: 'sk-pips', role: 'img', 'aria-label': `${num(t.required, 1)} of ${n} approvals` },
+          Array.from({ length: Math.min(n, 12) }, (_, i) => h('i', { key: i, className: 'sk-pip', 'data-on': i < need }))),
+        h('span', { className: 'sk-tier-m' }, TIER_NOTE[t.tier] || ''))
+    })))
+}
+
 function Decisions({ recent, last }) {
   const rows = list(recent).slice(0, 4)
   return h('section', { className: 'sk-card', 'aria-label': 'Recent decisions' },
@@ -393,7 +423,7 @@ function Approvals({ ctx }) {
     h('div', { className: 'sk-wrap' },
       h('header', { className: 'sk-head' },
         h('div', { className: 'sk-brand' }, h('div', { className: 'sk-key' }, ICON.key()),
-          h('div', null, h('div', { className: 'sk-title' }, 'Second key'), h('div', { className: 'sk-tag' }, 'The person who asks can never be the one who approves.'))),
+          h('div', null, h('div', { className: 'sk-title' }, 'Second key'), h('div', { className: 'sk-tag' }, h('b', null, 'A multisig for your AI agent.'), ' M of N teammates sized to the risk. The requester can\u2019t sign. The agent can\u2019t change the signers.'))),
         h('div', { className: 'sk-pills' },
           h('span', { className: 'sk-pill', 'data-tone': pillTone }, h('i'), armed.state, armed.fingerprint && h('span', { className: 'sk-fp sk-mono' }, clip(armed.fingerprint, 8))),
           h('span', { className: 'sk-pill', 'data-tone': error ? 'yellow' : 'green', title: error || 'Updating every second' }, h('i'), error ? 'Reconnecting' : 'Live'))),
@@ -402,7 +432,7 @@ function Approvals({ ctx }) {
           ballots.length
             ? ballots.map(b => h(Ballot, { key: b.request_id, ballot: b, now, fetchedAt: snap.at, serverNow: num(data.now) * 1000 }))
             : h(Idle, { roster: data.roster, last: list(data.recent)[0] })),
-        h('div', { className: 'sk-col' }, h(Gate, { armed }), h(Decisions, { recent: data.recent }))),
+        h('div', { className: 'sk-col' }, h(Gate, { armed }), h(Tiers, { tiers: data.tiers, roster: data.roster }), h(Decisions, { recent: data.recent }))),
       h(Chain, { ledger: data.ledger || {}, fresh })))
 }
 

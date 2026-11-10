@@ -1,7 +1,7 @@
 manifest_version: 2
 api_version: 1
 name: second-key
-version: "0.1.0"
+version: "0.2.0"
 description: >-
   Team approvals for shared Hermes bots. Dangerous commands need N votes from your roster by
   Telegram DM, sized to the risk. The requester never counts, and an agent that edits its own
