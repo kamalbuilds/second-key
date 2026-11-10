@@ -36,7 +36,7 @@ Rules that decide the number of approvals, largest wins:
 
 - `required` (default 1) for any flagged command
 - `critical_required` (default 2) when the command matches one of `critical_patterns`
-- `unknown_requester_required` (default 2) when the turn comes from a local session with no chat sender. Cron jobs never reach an approval transport: Hermes applies `approvals.cron_mode` to them.
+- `unknown_requester_required` (default 2) when the turn comes from a local session with no chat sender. Cron jobs, `hermes -q` runs and webhook or API sessions never reach an approval transport: Hermes applies `approvals.cron_mode`, `single_query_mode` and `unattended_mode` to them. second-key arms only while all three are `deny`, Hermes' default, so a job the agent schedules cannot run a flagged command nobody voted on.
 
 second-key denies at once, and DMs nobody, when:
 
@@ -48,10 +48,10 @@ second-key denies at once, and DMs nobody, when:
 
 - **Commands:** dangerous terminal commands and `execute_code` scripts that Hermes sends to its approval transport.
 - **Chat commands:** `/yolo` and `/approvals` switch approvals off or down for the whole profile, so second-key drops them from every chat before they reach Hermes, including when they are wrapped in `/loop`, `/queue`, `/bg`, `/steer` or `/heartbeat`. The profile owner changes them from the local CLI.
-- **The agent editing its own guard:** when second-key arms, it records the settings that decide approvals: the selected transport, the fallback, `approvals.mode`, plugin isolation, and its own roster and rules. Before every tool call it checks them again. If any of them changed, however the change was made, it stops every tool call and DMs the approvers which settings changed. The profile owner resumes the agent by running `/secondkey arm` from a local Hermes session; the command is refused from chats.
-- **Direct commands:** `hermes config set|unset|edit`, `hermes plugins disable|remove`, `hermes approvals` and `hermes gateway restart|stop` are refused before they run, and so are file writes under `~/.ssh`.
+- **The agent editing its own guard:** when second-key arms, it records the settings that decide approvals: the selected transport, the fallback, `approvals.mode`, the cron, single-query and unattended modes, plugin isolation, and its own roster and rules. Before every tool call it checks them again. If any of them changed, however the change was made, it stops every tool call and DMs the approvers which settings changed. The profile owner resumes the agent by running `/secondkey arm` from a local Hermes session; the command is refused from chats.
+- **Direct commands:** `hermes config set|unset|edit`, `hermes plugins disable|remove`, `hermes approvals`, `hermes gateway restart|stop` and `/secondkey arm` are refused before they run, and so are file writes into your SSH directory.
 
-Hermes asks for some other approvals (protected file writes, computer use, MCP elicitation) on its own chat prompts, which do not go through approval transports. `/secondkey` checks whether second-key is actually armed: selected as the transport, no builtin fallback, and `approvals.mode` not `off` or `smart`.
+Hermes asks for some other approvals (protected file writes, computer use, MCP elicitation) on its own chat prompts, which do not go through approval transports. `/secondkey` checks whether second-key is actually armed: selected as the transport, no builtin fallback, `approvals.mode: manual`, and no `approve` mode for cron, `-q` or unattended runs.
 
 ## Setup
 
@@ -67,7 +67,7 @@ hermes plugins install kamalbuilds/second-key/second-key --enable
    hermes config set SECONDKEY_TELEGRAM_BOT_TOKEN <token>
    ```
    Hermes saves it to the profile's `.env`.
-3. Each approver opens a DM with the bot and sends `/start`. The bot replies with their Telegram id.
+3. Run `/secondkey enroll` in a Hermes session. For the next five minutes the bot answers DMs: each approver sends it `/start` and gets their Telegram id back.
 4. Configure the plugin and select it as the approval transport:
    ```yaml
    plugins:
@@ -85,8 +85,10 @@ hermes plugins install kamalbuilds/second-key/second-key --enable
    security:
      approval:
        transport: secondkey
+   approvals:
+     mode: manual
    ```
-   `aliases` lists the same person's ids on other chat platforms, so a request Priya starts from Discord is still hers. Critical patterns match case-insensitively.
+   `aliases` lists the same person's ids on other chat platforms, so a request Priya starts from Discord is still hers. Critical patterns match case-insensitively. `approvals.mode: manual` sends every flagged command to the approvers; Hermes' default, `smart`, lets an auxiliary model approve some on its own, so second-key arms only under `manual`.
 5. Arm it: second-key arms itself on first load when the settings above are in place. To change the roster or rules later, edit `config.yaml`, then run `/secondkey arm` from a local session. `/secondkey` shows whether it is armed, the policy, and whether the token is set. `/secondkey ledger 20` shows recent decisions and whether the ledger chain is intact.
 
 ## The ledger
@@ -97,7 +99,7 @@ Every presentation, vote, refusal, refused chat command, refused tool call and d
 
 - **Network:** `api.telegram.org` only, with the bot token from `SECONDKEY_TELEGRAM_BOT_TOKEN`. Redirects are refused.
 - **What approvers see:** the command after Hermes' own redaction, Hermes' reason for asking, and the requester's display name, platform and platform user id.
-- **Background thread:** one long-poll thread reads the bot's updates. It starts on the first approval or `/start` and runs until Hermes exits.
+- **Background thread:** one long-poll thread reads the bot's updates while a request is waiting for votes, and for five minutes after `/secondkey enroll`. It stops on its own once neither holds, and when the plugin unloads.
 - **Files:** writes its ledger and the armed settings (`armed.json`) under `plugin-data/second-key/`. Reads Hermes' `config.yaml` (read-only) before tool calls, re-parsing it only when the file changed.
 - **Credentials:** reads the bot token through `agent.secret_scope.get_secret`. It never reads `.env`, `auth.json` or any other credential store.
 - **No telemetry, no self-updater, no shell commands, no dependencies beyond the standard library.**
@@ -122,5 +124,8 @@ The suite drives the plugin through Hermes' real `ApprovalRequest`, `invoke_appr
 - the agent running `hermes config set approvals.mode off`, or editing `config.yaml` by any other route (the next tool call is stopped and approvers are alerted)
 - `/approvals off` and `/yolo` wrapped in `/loop` and similar commands
 - ordinary developer commands that mention config files passing untouched
+- `cron_mode`, `single_query_mode` or `unattended_mode` set to `approve` (not armed)
+- the README's own setup block arming under Hermes' real config loader
+- the Telegram reader stopping when no request is open and when the plugin unloads, and `/start` answered during enrollment
 
 Each guard was checked by breaking it and watching its test fail.

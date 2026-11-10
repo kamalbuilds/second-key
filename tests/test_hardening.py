@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -262,6 +263,86 @@ class LedgerTests(Base):
         plugin._record("presented", request_id="x")  # must not raise
 
 
+class CatalogReviewTests(unittest.TestCase):
+    """What the catalog reviewer and Hermes' own installer check, run against the shipped tree."""
+
+    def test_manifest_has_only_fields_hermes_reads(self):
+        from hermes_cli.plugins_manifest import parse_manifest_file
+        with self.assertNoLogs("hermes_cli.plugins", level="WARNING"):
+            self.assertIsNotNone(parse_manifest_file(ROOT / "plugin.yaml", ROOT, "user", ""))
+
+    def test_install_scan_is_clean(self):
+        from tools.plugin_guard import scan_plugin
+        result = scan_plugin(ROOT)
+        self.assertEqual(result.verdict, "safe", [(f.pattern_id, f.file, f.line) for f in result.findings])
+
+    def test_readme_setup_block_arms_under_hermes_defaults(self):
+        import os
+        import re
+        import textwrap
+        readme = (ROOT / "README.md").read_text()
+        block = re.search(r"4\. Configure.*?```yaml\n(.*?)```", readme, re.S).group(1)
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, "config.yaml").write_text(textwrap.dedent(block))
+            with patch.dict(os.environ, {"HERMES_HOME": home}):
+                view = plugin._current_view()
+        self.assertEqual(plugin.tripwire.problems(view), [])
+        self.assertEqual(len(view["settings"]["approvers"]), 3)
+
+    def test_unattended_approve_modes_refuse_to_arm(self):
+        for key in ("cron_mode", "single_query_mode", "unattended_mode"):
+            cfg = {"security": {"approval": {"transport": "secondkey"}},
+                   "approvals": {"mode": "manual", key: "approve"}}
+            problems = plugin.tripwire.problems(plugin.tripwire.watched(cfg, "second-key", "secondkey"))
+            self.assertTrue(any(key in p for p in problems), key)
+
+    def test_agent_shell_cannot_rearm(self):
+        out = plugin._on_pre_tool_call(tool_name="terminal", args={"command": 'hermes chat -q "/secondkey arm"'})
+        self.assertEqual((out or {}).get("action"), "block")
+
+    def test_ledger_is_one_object_across_threads(self):
+        import os
+        import threading
+        import time
+        real = plugin.Ledger
+
+        class SlowLedger(real):
+            def __init__(self, path):
+                time.sleep(0.05)
+                super().__init__(path)
+
+        seen, gate = [], threading.Barrier(8)
+
+        def grab():
+            gate.wait()
+            seen.append(id(plugin._get_ledger()))
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"HERMES_HOME": home}), \
+                patch.object(plugin, "Ledger", SlowLedger):
+            plugin._ledger = None
+            threads = [threading.Thread(target=grab) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(5)
+            plugin._ledger = None
+        self.assertEqual(len(set(seen)), 1)
+
+    def test_unload_stops_the_telegram_reader(self):
+        import threading
+        stop = threading.Event()
+        callbacks = []
+        ctx = SimpleNamespace(register_hook=lambda *a, **k: None, register_approval_transport=lambda *a, **k: None,
+                              register_command=lambda *a, **k: None, on_unload=callbacks.append)
+        with patch.object(plugin, "_load_armed", lambda: None), \
+                patch.object(plugin, "_poller", SimpleNamespace(stop=stop.set)):
+            original_ctx = plugin._ctx
+            plugin.register(ctx)
+            plugin._ctx = original_ctx
+            for cb in callbacks:
+                cb()
+        self.assertTrue(stop.is_set(), "unload left the Telegram reader running")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -283,7 +364,7 @@ class AnchorTests(Base):
         import threading
         import time
         client = FakeClient()
-        plugin._bot = lambda: (client, None)
+        plugin._bot = lambda: (client, SimpleNamespace(ensure_running=lambda: None))
         req = request()
         self.bind(req, platform="telegram", actor_id="111", actor_name="Priya")
         out = []

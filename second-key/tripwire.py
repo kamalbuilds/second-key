@@ -34,6 +34,8 @@ def watched(cfg: dict, plugin_key: str, transport: str) -> dict:
         "transport_fallback": str(security.get("transport_fallback") or "").strip().lower(),
         "approvals_mode": _mode(approvals.get("mode")),
         "cron_mode": _mode(approvals.get("cron_mode")),
+        "single_query_mode": _mode(approvals.get("single_query_mode")),
+        "unattended_mode": _mode(approvals.get("unattended_mode")),
         "isolation": str(plugins.get("isolation") or "").strip().lower(),
         "plugin_listed_enabled": plugin_key in (enabled or []) if isinstance(enabled, list) else None,
         "plugin_listed_disabled": plugin_key in (disabled or []) if isinstance(disabled, list) else False,
@@ -51,6 +53,10 @@ def problems(view: dict) -> list[str]:
         out.append("transport_fallback: builtin lets a failed transport fall back to the chat prompt")
     if view["approvals_mode"] in {"off", "smart"}:
         out.append(f"approvals.mode is {view['approvals_mode']!r}: Hermes decides some commands without asking")
+    for key, where in (("cron_mode", "cron jobs"), ("single_query_mode", "hermes -q runs"),
+                       ("unattended_mode", "webhook and API sessions")):
+        if view[key] == "approve":
+            out.append(f"approvals.{key} is 'approve': flagged commands in {where} run with no vote")
     if view["isolation"] == "host":
         out.append("plugins.isolation: host is set; approval transports need in-process plugins")
     if view["plugin_listed_disabled"]:

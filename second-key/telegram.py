@@ -1,7 +1,8 @@
 """Telegram Bot API delivery for second-key: DM each approver, collect button taps.
 
 stdlib only (urllib), so the plugin adds no dependency. One long-poll thread per process reads
-``getUpdates`` and hands each button tap to the ballot it belongs to. second-key uses its own bot,
+``getUpdates`` while it is wanted (a ballot is open, or enrollment is on) and hands each button tap
+to the ballot it belongs to. second-key uses its own bot,
 never the gateway's: two pollers on one token make Telegram answer 409 Conflict.
 
 The voter's identity is ``callback_query.from.id``, which Telegram sets. Button data carries only
@@ -13,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 import urllib.error
 import urllib.request
 from typing import Callable, Optional
@@ -88,8 +88,10 @@ VoteHandler = Callable[[str, str, str], str]  # (request_id, voter_telegram_id, 
 class Poller:
     """Single getUpdates loop. ``on_vote`` decides; the poller only parses and acknowledges."""
 
-    def __init__(self, client: BotClient, on_vote: VoteHandler, on_start: Callable[[str, str], None] | None = None):
+    def __init__(self, client: BotClient, on_vote: VoteHandler, on_start: Callable[[str, str], None] | None = None,
+                 wanted: Callable[[], bool] | None = None):
         self._client = client
+        self._wanted = wanted or (lambda: True)
         self._on_vote = on_vote
         self._on_start = on_start
         self._offset = 0
@@ -110,6 +112,10 @@ class Poller:
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
+            with self._lock:  # decided under the lock ensure_running takes, so a new ballot is never missed
+                if not self._wanted():
+                    self._thread = None
+                    return
             try:
                 updates = self._client.call(
                     "getUpdates",
@@ -157,8 +163,3 @@ _VOTE_REPLIES = {
     "ignored": "Not counted: you cannot vote on this request.",
     "unknown": "This request has already closed.",
 }
-
-
-def wait_until(event: threading.Event, deadline: float) -> bool:
-    remaining = deadline - time.monotonic()
-    return event.wait(max(0.0, remaining))

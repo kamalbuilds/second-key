@@ -75,8 +75,8 @@ class TransportTests(unittest.TestCase):
             TelegramHandler.updates.get_nowait()
         self.temp = tempfile.TemporaryDirectory()
         self.client = BotClient("123:test", base_url=self.base_url)
-        self.poller = Poller(self.client, plugin._on_vote)
-        self.poller.ensure_running()
+        # The plugin's own lifecycle: present() starts the reader, and it stops once no ballot is open.
+        self.poller = Poller(self.client, plugin._on_vote, plugin._on_start, wanted=plugin._poll_wanted)
         self.originals = (plugin._policy, plugin._bot, plugin._get_ledger)
         self.policy = lambda: plugin.quorum.parse_policy({
             "approvers": [{"name": "requester", "telegram_id": "111"},
@@ -96,6 +96,7 @@ class TransportTests(unittest.TestCase):
         plugin._bindings.clear()
         plugin._ballots.clear()
         plugin._ledger = None
+        plugin._enroll_until = 0.0
         self.temp.cleanup()
 
     def decide(self, voter=None, choice="once", command="echo ok"):
@@ -166,6 +167,21 @@ class TransportTests(unittest.TestCase):
 
     def test_critical_command_needs_two_and_denies_after_one(self):
         self.assertEqual(self.decide("222", command="rm -rf /data"), "deny")
+
+    def test_reader_stops_when_no_ballot_is_open(self):
+        self.assertEqual(self.decide("222"), "once")
+        for _ in range(100):
+            if self.poller._thread is None:
+                break
+            time.sleep(0.02)
+        self.assertIsNone(self.poller._thread, "Telegram reader kept polling with no ballot open")
+
+    def test_enroll_answers_start(self):
+        TelegramHandler.updates.put({"update_id": TelegramHandler.next_update, "message": {
+            "text": "/start", "chat": {"id": 444, "type": "private"}, "from": {"id": 444}}})
+        TelegramHandler.next_update += 1
+        self.assertIn("minutes", plugin._cmd_secondkey("enroll"))
+        self.assertTrue(TelegramHandler.sent.wait(2), f"/start got no reply; methods={TelegramHandler.methods}")
 
 
 if __name__ == "__main__":

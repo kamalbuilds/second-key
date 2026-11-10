@@ -39,6 +39,8 @@ _state_lock = threading.Lock()
 _client: BotClient | None = None
 _poller: Poller | None = None
 _ledger: Ledger | None = None
+_enroll_until = 0.0
+ENROLL_SECONDS = 300
 
 
 # ---------------------------------------------------------------- helpers
@@ -63,17 +65,22 @@ def _bot() -> tuple[BotClient, Poller]:
             if not token:
                 raise TelegramError(f"{TOKEN_ENV} is not set")
             _client = BotClient(token)
-            _poller = Poller(_client, _on_vote, _on_start)
-        _poller.ensure_running()
+            _poller = Poller(_client, _on_vote, _on_start, wanted=_poll_wanted)
         return _client, _poller
+
+
+def _poll_wanted() -> bool:
+    """Read the bot only while a ballot waits for votes or enrollment is on."""
+    return bool(_ballots) or time.monotonic() < _enroll_until
 
 
 def _get_ledger() -> Ledger:
     global _ledger
-    if _ledger is None:
-        from plugins.plugin_storage import plugin_data_dir
-        _ledger = Ledger(plugin_data_dir("second-key") / "ledger.jsonl")
-    return _ledger
+    with _state_lock:  # two Ledger objects would each lock alone and fork the hash chain
+        if _ledger is None:
+            from plugins.plugin_storage import plugin_data_dir
+            _ledger = Ledger(plugin_data_dir("second-key") / "ledger.jsonl")
+        return _ledger
 
 
 def _record(event: str, **fields) -> dict | None:
@@ -146,7 +153,7 @@ def _on_pre_gateway_dispatch(event=None, **kwargs):
 # only refuses the direct commands, without blocking ordinary work that mentions config files.
 _TAMPER = re.compile(
     r"\bhermes\S*\s+(config\s+(set|unset|edit|migrate)|plugins?\s+(disable|remove|uninstall)"
-    r"|approvals?\b|gateway\s+(restart|stop))",
+    r"|approvals?\b|gateway\s+(restart|stop))|/secondkey\s+arm\b",
     re.IGNORECASE)
 _WRITE_TOOLS = {"write_file", "patch", "edit_file", "apply_patch", "str_replace_editor", "create_file"}
 _EXEC_TOOLS = {"terminal", "execute_code", "shell", "bash", "process"}
@@ -265,7 +272,7 @@ def _alert_approvers(reasons: list[str]) -> None:
 
 def _on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
     """Two jobs. Stop every tool call while the approval settings differ from the armed ones, and
-    refuse the direct commands an agent would use to switch approvals off or rewrite ~/.ssh."""
+    refuse the direct commands an agent would use to switch approvals off or rewrite the SSH directory."""
     reasons = _check_tripwire()
     name = str(tool_name or "")
     if reasons:
@@ -274,9 +281,9 @@ def _on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
             + ", ".join(reasons)[:300] + "). Tools are stopped until the profile owner runs "
             "/secondkey arm from a local Hermes session.")}
     if name in _WRITE_TOOLS and isinstance(args, dict) and _under_ssh_dir(str(args.get("path") or args.get("file_path") or "")):
-        _record("tool_refused", tool=name, why="writes under ~/.ssh")
+        _record("tool_refused", tool=name, why="writes into the SSH directory")
         return {"action": "block", "message": (
-            "second-key: writes under ~/.ssh can make later ssh commands run anything, and Hermes "
+            "second-key: writes into the SSH directory can make later ssh commands run anything, and Hermes "
             "asks for them in chat where the requester can answer. Refused.")}
     if name in _EXEC_TOOLS and _TAMPER.search(_arg_text(args)):
         _record("tool_refused", tool=name, why="changes approval configuration")
@@ -348,13 +355,14 @@ def present(request) -> Any:
         return deny
 
     try:
-        client, _ = _bot()
+        client, poller = _bot()
     except TelegramError as exc:
         _record("refused", **base, why=str(exc))
         return deny
 
     with _state_lock:
         _ballots[request.request_id] = ballot
+    poller.ensure_running()
     text = _ballot_text(request, requester, requester_name, ballot)
     sent: list[tuple[str, int]] = []
     for approver in ballot.eligible:
@@ -417,6 +425,7 @@ def _closing_text(request, ballot: quorum.Ballot, outcome: str) -> str:
 # ---------------------------------------------------------------- command
 
 def _cmd_secondkey(args: str = "", **kwargs) -> str:
+    global _enroll_until
     sub = (args or "").strip().split()
     action = sub[0] if sub else "status"
     if action == "ledger":
@@ -426,6 +435,15 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
         head = f"ledger chain {'intact' if ok else f'BROKEN at line {bad}'}"
         return "\n".join([head] + [f"{e['ts']} {e['event']} {e.get('outcome') or e.get('result') or ''}".rstrip()
                                    for e in entries])
+    if action == "enroll":
+        try:
+            _, poller = _bot()
+        except TelegramError as exc:
+            return f"second-key: cannot enroll: {exc}"
+        _enroll_until = time.monotonic() + ENROLL_SECONDS
+        poller.ensure_running()
+        return (f"second-key: reading the bot for {ENROLL_SECONDS // 60} minutes. Each approver sends /start "
+                "to the bot in a DM and gets their Telegram id back.")
     if action == "arm":
         platform = str(kwargs.get("platform") or _session("HERMES_SESSION_PLATFORM") or "").lower()
         if platform not in _LOCAL_SURFACES:
@@ -476,5 +494,12 @@ def register(ctx) -> None:
     _load_armed()
     ctx.register_approval_transport(TRANSPORT, present)
     ctx.register_command("secondkey", _cmd_secondkey,
-                         description="second-key status, or `ledger [n]` for recent decisions",
-                         args_hint="[status|arm|ledger [n]]")
+                         description="second-key status, `enroll` to collect approver ids, `ledger [n]` for recent decisions",
+                         args_hint="[status|enroll|arm|ledger [n]]")
+    ctx.on_unload(_unload)
+
+
+def _unload() -> None:
+    """Stop the Telegram reader so a reloaded copy of the plugin is the only one polling."""
+    if _poller is not None:
+        _poller.stop()

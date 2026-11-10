@@ -197,17 +197,6 @@ def _positive_int(value, name: str) -> int:
     return n
 
 
-def roster_ids(policy: Policy) -> frozenset[str]:
-    keys: set[str] = set()
-    for a in policy.approvers:
-        keys |= a.identity_keys()
-    return frozenset(keys)
-
-
-def is_on_roster(policy: Policy, platform: str, user_id: str) -> bool:
-    return bool(platform and user_id) and f"{platform.lower()}:{user_id}" in roster_ids(policy)
-
-
 def describe(policy: Policy) -> Iterable[str]:
     yield f"{len(policy.approvers)} approver(s); requester never counts"
     yield f"default: {policy.required} yes vote(s) from someone other than the requester"
