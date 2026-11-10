@@ -86,3 +86,11 @@ def fingerprint(view: dict) -> str:
 def changes(before: dict, after: dict) -> list[str]:
     """Which watched settings differ, by name only (values can be long or sensitive)."""
     return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+
+
+def loosened(before: dict, after: dict) -> list[str]:
+    """Gate changes that let commands past approval: new allowlist entries and dropped deny rules."""
+    added = sorted(set(after.get("command_allowlist") or []) - set(before.get("command_allowlist") or []))
+    dropped = sorted(set(before.get("approvals_deny") or []) - set(after.get("approvals_deny") or []))
+    return ([f"command_allowlist adds {', '.join(added)}"] if added else []) + (
+        [f"approvals.deny drops {', '.join(dropped)}"] if dropped else [])

@@ -365,6 +365,33 @@ def _positive_int(value, name: str) -> int:
     return n
 
 
+def weakened(old_settings: dict | None, new_settings: dict | None) -> list[str]:
+    """What a settings change gives up. Fewer approvers, fewer votes required, a dropped critical
+    pattern and an alias that identifies a local session each make approvals easier to get, so
+    re-arming after one needs the armed roster's say. More approvers, more votes and more patterns
+    do not."""
+    try:
+        old = parse_policy(old_settings or {})
+    except ValueError as exc:
+        return [f"armed settings do not parse: {exc}"]
+    try:
+        new = parse_policy(new_settings or {})
+    except ValueError as exc:
+        return [f"new settings do not parse: {exc}"]
+    out = [f"approver {a.name} removed" for a in old.approvers
+           if a.telegram_id not in {b.telegram_id for b in new.approvers}]
+    out += [f"{key} {getattr(old, key)} to {getattr(new, key)}"
+            for key in ("required", "critical_required", "unknown_requester_required")
+            if getattr(new, key) < getattr(old, key)]
+    out += [f"critical pattern dropped: {DEFAULT_LABELS.get(p, p)}"
+            for p in old.critical_patterns if p not in new.critical_patterns]
+    before = {a.telegram_id: set(a.aliases) for a in old.approvers}
+    for a in new.approvers:
+        out += [f"{a.name} now aliases {alias}" for alias in sorted(set(a.aliases) - before.get(a.telegram_id, set()))
+                if alias.partition(":")[0] in LOCAL_PLATFORMS]
+    return out
+
+
 def describe(policy: Policy) -> Iterable[str]:
     yield f"{len(policy.approvers)} approver(s); requester never counts"
     yield f"default: {policy.required} yes vote(s) from someone other than the requester"

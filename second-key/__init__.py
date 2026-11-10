@@ -10,14 +10,17 @@ enforces host-side. Chat commands and tool calls that would switch approvals off
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from . import quorum, tripwire
@@ -36,6 +39,7 @@ _GATED_COMMANDS = frozenset({"yolo", "approvals"})
 _GATED_TOKEN = re.compile(r"(^|\s)/(yolo|approvals)\b", re.IGNORECASE)
 TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person
 
+REARM_SECONDS = 120  # how long approvers have to answer a re-arm ballot
 REFRESH_SECONDS = 15.0  # how often an open ballot's remaining time is rewritten in the DMs
 RECENT_KEPT = 8
 
@@ -52,6 +56,19 @@ class _Live:
     targets: list = field(default_factory=list)       # (chat_id, message_id, audience)
     lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False                              # set before the closing edit; later refreshes stand down
+
+
+@dataclass(frozen=True)
+class _Ask:
+    """The fields of Hermes' ApprovalRequest that a ballot reads, for a request second-key raises itself."""
+
+    request_id: str
+    command: str
+    description: str
+    pattern_key: str
+    digest: str
+    timeout_seconds: float
+    headline: str = ""
 
 
 _ctx: Any = None
@@ -444,6 +461,13 @@ def _present(request) -> Any:
         _record("refused", request_id=request.request_id, reason=f"bad config: {exc}")
         return deny
 
+    return request.respond(_decide(request, requester, requester_name, origin_chat, policy)[0])
+
+
+def _decide(request, requester: quorum.Requester, requester_name: str, origin_chat: str,
+            policy: quorum.Policy) -> tuple[str, list[str]]:
+    """Put one request to the approvers and return (``once`` or ``deny``, who said yes). ``request`` is Hermes' redacted
+    ApprovalRequest, or the same fields from second-key itself (a re-arm ballot)."""
     wait = max(1.0, float(request.timeout_seconds) - 2.0)  # leave Hermes two seconds to act on the answer
     ballot = quorum.open_ballot(policy, request.request_id, request.command, requester, timeout=wait)
     base = dict(request_id=request.request_id, digest=request.digest, requester=requester.key or "unknown",
@@ -455,13 +479,13 @@ def _present(request) -> Any:
                 why="fewer eligible approvers than votes required")
         _tell_requester(note_chat, f"Denied: this command needs {ballot.required} approval(s) from people other "
                         f"than you, and only {len(ballot.eligible)} on the roster qualify.\n\n{request.command}")
-        return deny
+        return "deny", []
 
     try:
         client, poller = _bot()
     except TelegramError as exc:
         _record("refused", **base, why=str(exc))
-        return deny
+        return "deny", []
 
     live = _Live(request=request, requester=requester, name=requester_name, ballot=ballot,
                  deadline=time.monotonic() + wait)
@@ -520,7 +544,7 @@ def _present(request) -> Any:
     # Closing the DMs must not push the answer past Hermes' deadline: do it off this thread.
     threading.Thread(target=_close_all, args=(client, live, summary), name="second-key-close",
                      daemon=True).start()
-    return request.respond(outcome)
+    return outcome, sorted(ballot.yes.values())
 
 
 def _tell_requester(chat_id: str, text: str) -> None:
@@ -564,7 +588,7 @@ def _ballot_text(live: _Live, audience: str) -> str:
     risk = {"critical": f"CRITICAL ({request.pattern_key or 'critical pattern'})",
             "unknown requester": "requester unknown"}.get(ballot.tier, "standard")
     others = ", ".join(a.name for a in ballot.eligible)
-    lines = ["Hermes wants to run a command that needs approval.", f"Risk: {risk}", f"Asked by: {who}",
+    lines = [getattr(request, "headline", "") or "Hermes wants to run a command that needs approval.", f"Risk: {risk}", f"Asked by: {who}",
              f"Reason: {request.description}", "", request.command, ""]
     if audience == "requester":
         lines += [f"{live.name}: you asked for this command, so your tap here is Not counted. "
@@ -610,6 +634,42 @@ def _local_identity() -> str:
     return f"local:uid:{uid()}" if uid else ""
 
 
+def _weakening(view: dict) -> list[str]:
+    """What the current settings give up compared with the armed ones. Empty on first arming."""
+    if _armed_view is None:
+        return []
+    return quorum.weakened(_armed_view.get("settings"), view.get("settings")) + tripwire.loosened(_armed_view, view)
+
+
+def _ask_to_rearm(changes: list[str]) -> list[str] | None:
+    """Put a re-arm to the roster that was armed, as a critical ballot, and wait. Returns who approved,
+    or None for anything short of a full quorum: a deny, a timeout, a roster too small, a failed send."""
+    try:
+        policy = quorum.parse_policy((_armed_view or {}).get("settings") or {})
+    except ValueError as exc:
+        _record("rearm_denied", why=f"armed settings do not parse: {exc}", changes=changes)
+        return None
+    policy = replace(policy, required=policy.critical_required)
+    who = _local_identity() or "a local session"
+    requester = quorum.Requester(*(who.split(":", 1) if ":" in who else ("local", who)))
+    command = "re-arm second-key after: " + "; ".join(changes)
+    rid = uuid.uuid4().hex
+    request = SimpleNamespace(request_id=rid, digest=hashlib.sha256(command.encode()).hexdigest(), command=command,
+                              description="re-arm after the approval settings were weakened",
+                              pattern_key="re-arm after weakening", timeout_seconds=REARM_SECONDS,
+                              headline=f"{who} wants to re-arm second-key after a change that weakens it.")
+    _record("rearm_requested", request_id=rid, requester=requester.key, changes=changes)
+    try:
+        outcome, yes = _decide(request, requester, who, "", policy)
+    except TelegramError as exc:
+        _record("rearm_denied", request_id=rid, why=str(exc), changes=changes)
+        return None
+    if outcome != "once":
+        _record("rearm_denied", request_id=rid, changes=changes)
+        return None
+    return yes
+
+
 def _cmd_secondkey(args: str = "", **kwargs) -> str:
     global _enroll_until
     sub = (args or "").strip().split()
@@ -642,9 +702,17 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
         problems = tripwire.problems(view)
         if problems:
             return "second-key: not armed:\n" + "\n".join(f"  - {p}" for p in problems)
+        how = "/secondkey arm"
+        weaker = _weakening(view)
+        if weaker:
+            approved = _ask_to_rearm(weaker)
+            if approved is None:
+                return ("second-key: not re-armed. These changes make approvals easier to get, so the approvers "
+                        "who armed it must agree, and they did not:\n" + "\n".join(f"  - {w}" for w in weaker))
+            how += f" (approved by {', '.join(approved)})"
         _arm(view)
         fp = tripwire.fingerprint(view)[:16]
-        _record("armed", how="/secondkey arm", fingerprint=fp)
+        _record("armed", how=how, fingerprint=fp)
         return f"second-key armed (settings fingerprint {fp}). Tools are running again."
     try:
         policy = _policy()
