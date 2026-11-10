@@ -20,6 +20,7 @@ spec = importlib.util.spec_from_file_location("second_key_hardening", ROOT / "__
 plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
+plugin._state_file = lambda: Path(tempfile.gettempdir()) / "second-key-test-state.json"  # never the real profile's
 
 
 def request(command="echo ok"):

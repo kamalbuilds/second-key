@@ -79,3 +79,48 @@ class QuorumTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveViewTests(unittest.TestCase):
+    def ballot(self, command="rm -rf /srv", requester=("telegram", "111"), **settings):
+        return quorum.open_ballot(policy(critical_patterns=["rm -rf"], **settings), "r", command,
+                                  quorum.Requester(*requester), timeout=60)
+
+    def test_squares_fill_with_each_yes_and_never_overflow(self):
+        b = self.ballot()
+        self.assertEqual((b.squares(), b.progress()), ("□□", "0 of 2 approved"))
+        b.vote("222", "once")
+        self.assertEqual((b.squares(), b.progress()), ("■□", "1 of 2 approved: 222"))
+        b.vote("333", "once")
+        self.assertEqual((b.squares(), b.progress()), ("■■", "2 of 2 approved: 222, 333"))
+
+    def test_waiting_on_drops_each_approver_who_voted_yes(self):
+        b = self.ballot()
+        self.assertEqual(b.waiting_on(), ["222", "333"])
+        b.vote("222", "once")
+        self.assertEqual(b.waiting_on(), ["333"])
+
+    def test_risk_tier_follows_the_rule_that_set_the_vote_count(self):
+        self.assertEqual(self.ballot().tier, "critical")
+        self.assertEqual(self.ballot(command="ls").tier, "standard")
+        self.assertEqual(self.ballot(command="ls", requester=("local", "uid:501")).tier, "unknown requester")
+
+    def test_refused_taps_are_listed_by_name_with_the_reason(self):
+        b = self.ballot()
+        b.vote("111", "once")
+        b.vote("999", "once")
+        self.assertEqual([(n["name"], n["why"]) for n in b.not_counted], [("111", "requester"), ("999", "not-eligible")])
+        self.assertEqual(b.yes, {})
+
+    def test_snapshot_marks_requester_yes_and_waiting_and_carries_no_telegram_ids(self):
+        b = self.ballot()
+        b.vote("222", "once")
+        snap = b.snapshot()
+        self.assertEqual({a["name"]: a["state"] for a in snap["approvers"]}, {"111": "requester", "222": "yes", "333": "waiting"})
+        self.assertEqual((snap["required"], snap["tier"], snap["timeout"]), (2, "critical", 60))
+        self.assertNotIn("telegram_id", repr(snap))
+
+    def test_snapshot_shows_the_approver_who_denied(self):
+        b = self.ballot()
+        b.vote("222", "deny")
+        self.assertEqual({a["name"]: a["state"] for a in b.snapshot()["approvers"]}["222"], "no")

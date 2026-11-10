@@ -55,14 +55,28 @@ class BotClient:
             raise TelegramError(f"{method} failed: {body.get('description', 'not ok')}")
         return body.get("result") or {}
 
-    def send_ballot(self, chat_id: str, text: str, request_id: str) -> int:
-        markup = {"inline_keyboard": [[
+    @staticmethod
+    def _markup(request_id: str) -> dict:
+        return {"inline_keyboard": [[
             {"text": "Approve once", "callback_data": f"sk|{request_id}|once"},
             {"text": "Deny", "callback_data": f"sk|{request_id}|deny"},
         ]]}
-        msg = self.call("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": markup,
+
+    def send_ballot(self, chat_id: str, text: str, request_id: str) -> int:
+        msg = self.call("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": self._markup(request_id),
                                         "disable_web_page_preview": True})
         return int(msg.get("message_id", 0))
+
+    def notify(self, chat_id: str, text: str) -> None:
+        self.call("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+
+    def edit_ballot(self, chat_id: str, message_id: int, text: str, request_id: str) -> None:
+        """Rewrite an open ballot in place. editMessageText drops the buttons unless they are sent again."""
+        try:
+            self.call("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text,
+                                          "reply_markup": self._markup(request_id), "disable_web_page_preview": True})
+        except TelegramError as exc:
+            logger.info("second-key: could not refresh ballot message: %s", exc)
 
     def close_ballot(self, chat_id: str, message_id: int, text: str) -> None:
         try:
@@ -70,9 +84,10 @@ class BotClient:
         except TelegramError as exc:
             logger.info("second-key: could not update ballot message: %s", exc)
 
-    def answer(self, callback_id: str, text: str) -> None:
+    def answer(self, callback_id: str, text: str, alert: bool = False) -> None:
         try:
-            self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:190]})
+            self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:190],
+                                              "show_alert": alert})
         except TelegramError as exc:
             logger.info("second-key: answerCallbackQuery failed: %s", exc)
 
@@ -148,7 +163,8 @@ class Poller:
                 self._client.answer(str(cq.get("id", "")), "Not a second-key button.")
                 return
             result = self._on_vote(parts[1], voter, parts[2])
-            self._client.answer(str(cq.get("id", "")), _VOTE_REPLIES.get(result.split(":")[0], result))
+            reply = _VOTE_REPLIES.get(result) or _VOTE_REPLIES.get(result.split(":")[0], result)
+            self._client.answer(str(cq.get("id", "")), reply, alert=result.startswith("ignored"))
             return
         msg = update.get("message") or {}
         text = str(msg.get("text") or "")
@@ -160,6 +176,7 @@ _VOTE_REPLIES = {
     "counted": "Vote counted. Waiting for another approver.",
     "approved": "Approved. The command can run once.",
     "denied": "Denied. The command will not run.",
+    "ignored:requester": "Not counted: you asked for this command, so you cannot approve it. Other approvers must.",
     "ignored": "Not counted: you cannot vote on this request.",
     "unknown": "This request has already closed.",
 }

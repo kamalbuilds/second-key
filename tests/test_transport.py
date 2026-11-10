@@ -21,6 +21,7 @@ plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 from second_key.telegram import BotClient, Poller
+plugin._state_file = lambda: Path(tempfile.gettempdir()) / "second-key-test-state.json"  # never the real profile's
 
 
 class TelegramHandler(BaseHTTPRequestHandler):
@@ -128,7 +129,8 @@ class TransportTests(unittest.TestCase):
             {"approvers": [{"name": "requester", "telegram_id": "111"}, {"name": "approver", "telegram_id": "222"}],
              "required": 1, "critical_required": 2, "critical_patterns": [r"rm\s+-rf"]})
         self.assertEqual(self.decide(command="rm -rf /data"), "deny")
-        self.assertNotIn("sendMessage", [m for m, _ in TelegramHandler.methods])
+        sends = [m for m, _ in TelegramHandler.methods if m == "sendMessage"]
+        self.assertEqual(sends, ["sendMessage"], "no ballot goes out, only the note telling the requester why")
 
     def test_two_other_approvers_meet_critical_quorum(self):
         request_choice = self.decide_two("222", "333", command="rm -rf /data")

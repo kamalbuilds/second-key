@@ -55,16 +55,19 @@ class Ledger:
     def tail(self, n: int) -> list[dict]:
         return self.entries()[-max(0, n):]
 
+    def audit(self) -> list[bool]:
+        """One flag per entry: whether it links to the entry before it and hashes to its own claim."""
+        prev, flags = GENESIS, []
+        for entry in self.entries():
+            claimed = entry.get("hash")
+            flags.append(entry.get("prev") == prev and _digest(entry) == claimed)
+            prev = claimed
+        return flags
+
     def verify(self) -> tuple[bool, int]:
         """(True, 0) when every link holds; else (False, 1-based line number of the first break)."""
-        prev = GENESIS
-        for i, entry in enumerate(self.entries(), 1):
-            claimed = entry.get("hash")
-            body = {k: v for k, v in entry.items() if k != "hash"}
-            if entry.get("prev") != prev or _digest(body) != claimed:
-                return False, i
-            prev = claimed
-        return True, 0
+        flags = self.audit()
+        return (True, 0) if all(flags) else (False, flags.index(False) + 1)
 
 
 def _digest(entry: dict) -> str:

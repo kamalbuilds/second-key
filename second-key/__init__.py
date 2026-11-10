@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -35,10 +36,31 @@ _GATED_COMMANDS = frozenset({"yolo", "approvals"})
 _GATED_TOKEN = re.compile(r"(^|\s)/(yolo|approvals)\b", re.IGNORECASE)
 TELEGRAM_ANONYMOUS_ADMIN = "1087968824"  # GroupAnonymousBot: an anonymous group admin, not a person
 
+REFRESH_SECONDS = 15.0  # how often an open ballot's remaining time is rewritten in the DMs
+RECENT_KEPT = 8
+
+
+@dataclass
+class _Live:
+    """One open ballot and the Telegram messages that show it."""
+
+    request: Any
+    requester: quorum.Requester
+    name: str
+    ballot: quorum.Ballot
+    deadline: float                                   # time.monotonic() when Hermes gives up
+    targets: list = field(default_factory=list)       # (chat_id, message_id, audience)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False                              # set before the closing edit; later refreshes stand down
+
+
 _ctx: Any = None
-_bindings: dict[str, tuple[quorum.Requester, str, float, contextvars.Context]] = {}
+_bindings: dict[str, tuple[quorum.Requester, str, float, contextvars.Context, str]] = {}
 _ballots: dict[str, quorum.Ballot] = {}
+_lives: dict[str, _Live] = {}
+_recent: list[dict] = []
 _state_lock = threading.Lock()
+_publish_lock = threading.Lock()  # the poller and the ballot's own thread both publish; one writer at a time
 _client: BotClient | None = None
 _poller: Poller | None = None
 _ledger: Ledger | None = None
@@ -94,6 +116,32 @@ def _record(event: str, **fields) -> dict | None:
         return None
 
 
+def _state_file() -> Path:
+    from plugins.plugin_storage import plugin_data_dir
+    return plugin_data_dir("second-key") / "state.json"
+
+
+def _publish() -> None:
+    """Write what the Desktop pane shows: open ballots, the last few closed ones and any trip.
+    The pane's backend reads this file; the ledger stays the record of truth."""
+    with _publish_lock:
+        with _state_lock:
+            ballots = []
+            for live in _lives.values():
+                ballots.append({**live.ballot.snapshot(), "command": live.request.command,
+                                "description": live.request.description, "pattern_key": live.request.pattern_key,
+                                "requester": {"name": live.name, "platform": live.requester.platform or "local",
+                                              "key": live.requester.key}})
+            state = {"updated": time.time(), "ballots": ballots, "recent": list(_recent), "tripped": list(_tripped)}
+        try:
+            path = _state_file()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, sort_keys=True))
+            tmp.replace(path)
+        except OSError as exc:
+            logger.warning("second-key: could not write the pane state (%s)", type(exc).__name__)
+
+
 def _expire_bindings(now: float) -> None:
     for rid in [r for r, b in _bindings.items() if now - b[2] > _BINDING_TTL]:
         _bindings.pop(rid, None)
@@ -113,10 +161,11 @@ def _on_pre_approval_request(request_id: str = "", **kwargs) -> None:
                                  user_id=_session("HERMES_SESSION_ACTOR_ID") or _session("HERMES_SESSION_USER_ID"))
     name = (_session("HERMES_SESSION_ACTOR_NAME") or _session("HERMES_SESSION_USER_NAME")
             or requester.user_id)
+    chat_id = _session("HERMES_SESSION_CHAT_ID")
     with _state_lock:
         now = time.monotonic()
         _expire_bindings(now)
-        _bindings[request_id] = (requester, name, now, contextvars.copy_context())
+        _bindings[request_id] = (requester, name, now, contextvars.copy_context(), chat_id)
 
 
 def _command_of(event) -> str:
@@ -210,10 +259,15 @@ def _arm(view: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({"fingerprint": tripwire.fingerprint(view), "view": view}, sort_keys=True))
     tmp.replace(path)
+    _publish()
 
 
 def _load_armed() -> None:
-    global _armed_view
+    global _armed_view, _recent
+    try:
+        _recent = list(json.loads(_state_file().read_text()).get("recent") or [])[-RECENT_KEPT:]
+    except (OSError, ValueError, AttributeError):
+        _recent = []
     try:
         data = json.loads(_armed_file().read_text())
         if data.get("fingerprint") == tripwire.fingerprint(data.get("view") or {}):
@@ -254,6 +308,7 @@ def _check_tripwire() -> list[str]:
     if reasons:
         _tripped = reasons
         _record("tripwire", changed=reasons)
+        _publish()
         _alert_approvers(reasons)
     return _tripped
 
@@ -329,6 +384,9 @@ def _on_vote(request_id: str, voter: str, choice: str) -> str:
         return "unknown"
     result = ballot.vote(voter, choice)
     _record("vote", request_id=request_id, voter=voter, choice=choice, result=result)
+    _publish()
+    if result == "counted" or (result.startswith("ignored:") and result != "ignored:closed"):
+        _refresh(_lives.get(request_id))
     return result
 
 
@@ -368,7 +426,7 @@ def _present(request) -> Any:
         # request reached us some other way, so nobody can say who asked: refuse.
         _record("refused", request_id=request.request_id, why="no requester binding for this request")
         return deny
-    requester, requester_name = binding[:2]
+    requester, requester_name, _, _, origin_chat = binding
     if requester.platform and requester.platform != "local" and not requester.user_id:
         _record("refused", request_id=request.request_id, platform=requester.platform,
                 why="chat turn without a bound sender id")
@@ -386,12 +444,17 @@ def _present(request) -> Any:
         _record("refused", request_id=request.request_id, reason=f"bad config: {exc}")
         return deny
 
-    ballot = quorum.open_ballot(policy, request.request_id, request.command, requester)
+    wait = max(1.0, float(request.timeout_seconds) - 2.0)  # leave Hermes two seconds to act on the answer
+    ballot = quorum.open_ballot(policy, request.request_id, request.command, requester, timeout=wait)
     base = dict(request_id=request.request_id, digest=request.digest, requester=requester.key or "unknown",
                 required=ballot.required, reason=ballot.reason, pattern_key=request.pattern_key)
+    note_chat = origin_chat if requester.platform == "telegram" and origin_chat else (
+        requester.user_id if requester.platform == "telegram" else "")
     if ballot.impossible:
         _record("refused", **base, eligible=len(ballot.eligible),
                 why="fewer eligible approvers than votes required")
+        _tell_requester(note_chat, f"Denied: this command needs {ballot.required} approval(s) from people other "
+                        f"than you, and only {len(ballot.eligible)} on the roster qualify.\n\n{request.command}")
         return deny
 
     try:
@@ -400,22 +463,38 @@ def _present(request) -> Any:
         _record("refused", **base, why=str(exc))
         return deny
 
+    live = _Live(request=request, requester=requester, name=requester_name, ballot=ballot,
+                 deadline=time.monotonic() + wait)
     with _state_lock:
         _ballots[request.request_id] = ballot
+        _lives[request.request_id] = live
+    _publish()
     poller.ensure_running()
-    text = _ballot_text(request, requester, requester_name, ballot)
     sent: list[tuple[str, int]] = []
     for approver in ballot.eligible:
         try:
-            sent.append((approver.telegram_id, client.send_ballot(approver.telegram_id, text, request.request_id)))
+            message_id = client.send_ballot(approver.telegram_id, _ballot_text(live, "approver"), request.request_id)
+            sent.append((approver.telegram_id, message_id))
+            live.targets.append((approver.telegram_id, message_id, "approver"))
         except TelegramError as exc:
             _record("delivery_failed", request_id=request.request_id, approver=approver.name, why=str(exc))
+    if note_chat:  # the requester sees why their own tap will not count, in the chat they asked from
+        try:
+            live.targets.append((note_chat, client.send_ballot(note_chat, _ballot_text(live, "requester"),
+                                                                request.request_id), "requester"))
+        except TelegramError as exc:
+            _record("delivery_failed", request_id=request.request_id, approver="requester note", why=str(exc))
     if len(sent) < ballot.required:
         ballot.done.set()
     _record("presented", **base, delivered=len(sent), eligible=len(ballot.eligible))
 
-    deadline = time.monotonic() + max(1.0, float(request.timeout_seconds) - 2.0)
-    ballot.done.wait(max(0.0, deadline - time.monotonic()))
+    while not ballot.done.is_set():
+        remaining = live.deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ballot.done.wait(min(remaining, REFRESH_SECONDS))
+        if not ballot.done.is_set() and live.deadline - time.monotonic() > 0:
+            _refresh(live)
     with _state_lock:
         _ballots.pop(request.request_id, None)
     ballot.done.set()  # late taps are ignored from here on
@@ -429,30 +508,78 @@ def _present(request) -> Any:
     summary = _closing_text(request, ballot, outcome)
     if entry:
         summary += f"\n\nledger {entry['hash'][:16]}"
+    with _state_lock:
+        _lives.pop(request.request_id, None)
+        _recent.append({**ballot.snapshot(), "command": request.command, "pattern_key": request.pattern_key,
+                        "requester": {"name": requester_name, "platform": requester.platform or "local",
+                                      "key": requester.key},
+                        "outcome": outcome, "yes": sorted(ballot.yes.values()), "no": ballot.no,
+                        "closed_at": time.time(), "ledger": entry["hash"] if entry else ""})
+        del _recent[:-RECENT_KEPT]
+    _publish()
     # Closing the DMs must not push the answer past Hermes' deadline: do it off this thread.
-    threading.Thread(target=_close_all, args=(client, sent, summary), name="second-key-close",
+    threading.Thread(target=_close_all, args=(client, live, summary), name="second-key-close",
                      daemon=True).start()
     return request.respond(outcome)
 
 
-def _close_all(client, sent, summary) -> None:
-    for chat_id, message_id in sent:
+def _tell_requester(chat_id: str, text: str) -> None:
+    if not chat_id:
+        return
+    try:
+        client, _ = _bot()
+        client.notify(chat_id, text)
+    except TelegramError as exc:
+        logger.info("second-key: could not tell the requester: %s", exc)
+
+
+def _close_all(client, live: _Live, summary: str) -> None:
+    with live.lock:  # waits for a refresh in flight, so the closing text is always the last edit
+        live.closed = True
+    for chat_id, message_id, _ in live.targets:
         client.close_ballot(chat_id, message_id, summary)
 
 
-def _ballot_text(request, requester: quorum.Requester, requester_name: str, ballot: quorum.Ballot) -> str:
-    who = (f"{requester_name} ({requester.platform} id {requester.user_id})" if requester.known
+def _refresh(live: _Live | None) -> None:
+    """Rewrite every open copy of a ballot with its current votes and remaining time."""
+    if live is None:
+        return
+    with live.lock:
+        if live.closed:
+            return
+        client, _ = _bot()
+        for chat_id, message_id, audience in list(live.targets):
+            client.edit_ballot(chat_id, message_id, _ballot_text(live, audience), live.request.request_id)
+
+
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def _ballot_text(live: _Live, audience: str) -> str:
+    request, requester, ballot = live.request, live.requester, live.ballot
+    who = (f"{live.name} ({requester.platform} id {requester.user_id})" if requester.known
            else "unknown requester")
-    lines = [
-        "Hermes wants to run a command that needs approval.",
-        f"Asked by: {who}",
-        f"Reason: {request.description}",
-        "",
-        request.command,
-        "",
-        f"Needs {ballot.required} approval(s) from people other than the requester ({ballot.reason}).",
-        f"No answer within {int(request.timeout_seconds)}s means deny.",
-    ]
+    risk = {"critical": f"CRITICAL ({request.pattern_key or 'critical pattern'})",
+            "unknown requester": "requester unknown"}.get(ballot.tier, "standard")
+    others = ", ".join(a.name for a in ballot.eligible)
+    lines = ["Hermes wants to run a command that needs approval.", f"Risk: {risk}", f"Asked by: {who}",
+             f"Reason: {request.description}", "", request.command, ""]
+    if audience == "requester":
+        lines += [f"{live.name}: you asked for this command, so your tap here is Not counted. "
+                  f"{ballot.required} approval(s) are needed from other people: {others}.", ""]
+    else:
+        lines += [f"Needs {ballot.required} approval(s) from people other than the requester ({ballot.reason}).", ""]
+    lines += [f"{ballot.squares()}  {ballot.progress()}"]
+    waiting = ballot.waiting_on()
+    if waiting:
+        lines.append(f"Waiting on: {', '.join(waiting)}")
+    if ballot.not_counted:
+        lines.append("Not counted: " + ", ".join(
+            f"{n['name']} ({'requester' if n['why'] == 'requester' else 'not an approver'})"
+            for n in ballot.not_counted))
+    lines.append(f"Time left: {_clock(live.deadline - time.monotonic())}. No answer means deny.")
     return "\n".join(lines)
 
 
@@ -465,7 +592,7 @@ def _closing_text(request, ballot: quorum.Ballot, outcome: str) -> str:
         verdict = "Denied: the approvals could not be written to the ledger."
     else:
         verdict = f"Denied: {len(ballot.yes)} of {ballot.required} approval(s) before the deadline."
-    return f"{verdict}\n\n{request.command}"
+    return f"{verdict}\n{ballot.squares()}  {ballot.progress()}\n\n{request.command}"
 
 
 # ---------------------------------------------------------------- command

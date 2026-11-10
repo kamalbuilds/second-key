@@ -16,7 +16,9 @@ counts as unknown, and ``unknown_requester_required`` applies, until an approver
 from __future__ import annotations
 
 import re
+import shlex
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -24,17 +26,93 @@ from typing import Iterable, Optional
 LOCAL_PLATFORMS = frozenset({"local", "cli", "tui", "desktop", "acp"})
 
 # Used when ``critical_patterns`` is not configured. A configured list, even an empty one, replaces it.
-DEFAULT_CRITICAL_PATTERNS = (
-    r"\brm\s+-\w*(rf|fr)",
-    r"\brm\s+-r\s+-f",
-    r"\brm\s+-f\s+-r",
-    r"\bdrop\s+(table|database)\b",
-    r"\bterraform\s+destroy\b",
-    r"\bgit\s+push\b.*\s(-f|--force|--force-with-lease)\b",
-    r"\bmkfs(\.\w+)?\b",
-    r"\bdd\b.*\bof=/dev/",
-    r"\bkubectl\s+delete\s+(namespaces?|ns)\b",
+# Each pattern is tried against the command as written and against its normalised forms (see
+# ``command_forms``): shell payloads unwrapped, chained commands split, short flags expanded so
+# ``rm -fr`` and ``rm --recursive --force`` both read ``rm -r -f``. This is a default list of common
+# destructive commands, not a complete one: a command it does not name is an ordinary request.
+_ARGS = r"[^;|&]*"
+_DEFAULTS = (
+    (r"\brm\b(?=" + _ARGS + r"\s-r\b)(?=" + _ARGS + r"\s-f\b)", "rm -rf"),
+    (r"\bfind\b" + _ARGS + r"\s-delete\b", "find -delete"),
+    (r"\bfind\b" + _ARGS + r"-exec\s+rm\b", "find -exec rm"),
+    (r"\b(shutil\.rmtree|os\.(remove|unlink|rmdir|removedirs))\b", "script deleting files"),
+    (r"\b(shred|wipefs)\b", "shred / wipefs"),
+    (r"\btruncate\s+(-|table\b)", "truncate"),
+    (r"\bdrop\s+(table|database|schema|index|view|user|role|extension)\b", "drop table / database"),
+    (r"\bgit\s+reset\b" + _ARGS + r"--hard\b", "git reset --hard"),
+    (r"\bgit\s+clean\b" + _ARGS + r"\s-f\b", "git clean -f"),
+    (r"\bgit\s+branch\b" + _ARGS + r"\s(?-i:-D)\b", "git branch -D"),
+    (r"\bgit\s+push\b" + _ARGS + r"\s(-f|--force|--force-with-lease)\b", "git push --force"),
+    (r"\b(chmod|chown|chgrp)\b" + _ARGS + r"\s-r\b", "recursive chmod / chown"),
+    (r"\bmk(e2)?fs(\.\w+)?\b", "make filesystem"),
+    (r"\bdd\b.*\bof=/dev/", "dd to a device"),
+    (r"\b(terraform|tofu|pulumi)\s+destroy\b", "terraform destroy"),
+    (r"\b(terraform|tofu)\s+apply\b" + _ARGS + r"-destroy\b", "terraform apply -destroy"),
+    (r"\bkubectl\s+delete\s+(namespaces?|ns|nodes?|pv|pvc|persistentvolumes?(claims?)?|crd|"
+     r"customresourcedefinitions?|deployments?|statefulsets?|daemonsets?|clusters?)\b", "kubectl delete"),
+    (r"\bkubectl\s+delete\b" + _ARGS + r"\s--all\b", "kubectl delete --all"),
+    (r"\bhelm\s+(uninstall|delete)\b", "helm uninstall"),
+    (r"\bdocker\s+((system|volume|image|container|network)\s+prune|volume\s+rm)\b", "docker prune"),
+    (r"\baws\s+s3\s+rb\b", "aws s3 rb"),
+    (r"\baws\s+s3\s+rm\b" + _ARGS + r"--recursive\b", "aws s3 rm --recursive"),
+    (r"\baws\b" + _ARGS + r"\b(terminate|delete)-[a-z-]+\b", "aws delete / terminate"),
+    (r"\b(gcloud|az|doctl|heroku|flyctl|railway)\b" + _ARGS + r"\b(delete|destroy)\b", "cloud delete"),
 )
+DEFAULT_CRITICAL_PATTERNS = tuple(p for p, _ in _DEFAULTS)
+DEFAULT_LABELS = dict(_DEFAULTS)
+
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
+_LONG_FLAGS = {"--recursive": "-r", "--force": "-f"}
+_MAX_FORMS = 64
+_MAX_COMMAND = 8000
+_MAX_DEPTH = 4
+
+
+def _expand_flags(tokens: list[str]) -> list[str]:
+    """``-rfv`` becomes ``-r -f -v``, ``-R`` becomes ``-r``, ``--recursive`` becomes ``-r``. A token that
+    is not a short-flag cluster (``-delete`` for find, ``-D``) is left alone, so both readings exist."""
+    out: list[str] = []
+    for tok in tokens:
+        if tok in _LONG_FLAGS:
+            out.append(_LONG_FLAGS[tok])
+        elif re.fullmatch(r"-[A-Za-z]{2,}", tok):
+            out.extend(f"-{c.lower()}" for c in tok[1:])
+        elif re.fullmatch(r"-[A-Z]", tok):
+            out.append(tok.lower())
+        else:
+            out.append(tok)
+    return out
+
+
+def command_forms(command: str, _depth: int = 0) -> list[str]:
+    """The command as written plus its normalised readings, so a pattern cannot be dodged by flag order,
+    combined flags, ``;``/``&&``/``|`` chains or an ``sh -c '...'`` wrapper. Bounded in size and depth."""
+    command = (command or "")[:_MAX_COMMAND]
+    forms = [command]
+    if _depth >= _MAX_DEPTH:
+        return forms
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:  # unbalanced quotes: read it as plain words rather than refuse to look
+        tokens = command.split()
+    simple: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok and set(tok) <= set(";&|()"):
+            simple.append([])
+        else:
+            simple[-1].append(tok)
+    for words in (w for w in simple if w):
+        forms.append(" ".join(words))
+        forms.append(" ".join(_expand_flags(words)))
+        for i, word in enumerate(words[:-1]):
+            if word.rsplit("/", 1)[-1] in _SHELLS and any(re.fullmatch(r"-[a-z]*c[a-z]*", w) for w in words[i + 1:-1]):
+                forms.extend(command_forms(words[-1], _depth + 1))
+                break
+        if len(forms) >= _MAX_FORMS:
+            break
+    return forms[:_MAX_FORMS]
 
 
 @dataclass(frozen=True)
@@ -95,10 +173,12 @@ def identified(policy: Policy, requester: Requester) -> bool:
 def required_votes(policy: Policy, command: str, requester: Requester) -> tuple[int, str]:
     """How many distinct yes votes this request needs, and why. The largest applicable rule wins."""
     need, reason = max(1, policy.required), "default"
+    forms = command_forms(command)
     for pattern in policy.compiled_critical():
-        if pattern.search(command or ""):
+        if any(pattern.search(form) for form in forms):
             if policy.critical_required > need:
-                need, reason = policy.critical_required, f"critical pattern {pattern.pattern!r}"
+                label = DEFAULT_LABELS.get(pattern.pattern)
+                need, reason = policy.critical_required, f"critical pattern: {label}" if label else f"critical pattern {pattern.pattern!r}"
             break
     if not identified(policy, requester) and policy.unknown_requester_required > need:
         need, reason = policy.unknown_requester_required, "requester unknown"
@@ -124,6 +204,11 @@ class Ballot:
     yes: dict[str, str] = field(default_factory=dict)   # telegram_id -> name
     no: Optional[str] = None                             # name of the approver who denied
     ignored: list[str] = field(default_factory=list)    # why a vote was refused, for the ledger
+    roster: tuple[Approver, ...] = ()                    # everyone on the roster, for the live views
+    tier: str = "standard"                               # "critical", "unknown requester" or "standard"
+    timeout: float = 0.0                                 # seconds Hermes gave this request
+    opened_at: float = field(default_factory=time.time)
+    not_counted: list[dict] = field(default_factory=list)  # taps that were refused: voter, name, why
     done: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -140,10 +225,12 @@ class Ballot:
                 return "ignored:closed"
             if voter in self.excluded or (self.requester.known and self.requester.key == f"telegram:{voter}"):
                 self.ignored.append(f"requester {voter} tried to approve their own request")
+                self._refuse(voter, "requester")
                 return "ignored:requester"
             match = next((a for a in self.eligible if a.telegram_id == voter), None)
             if match is None:
                 self.ignored.append(f"{voter} is not an eligible approver")
+                self._refuse(voter, "not-eligible")
                 return "ignored:not-eligible"
             if choice == "deny":
                 self.no = match.name
@@ -158,6 +245,40 @@ class Ballot:
                 return "approved"
             return "counted"
 
+    def _refuse(self, voter: str, why: str) -> None:
+        name = next((a.name for a in self.roster if a.telegram_id == voter), voter)
+        self.not_counted.append({"voter": voter, "name": name, "why": why, "at": time.time()})
+
+    def squares(self) -> str:
+        """One square per required vote, filled for each yes: ``■□``."""
+        with self._lock:
+            return "■" * min(len(self.yes), self.required) + "□" * max(0, self.required - len(self.yes))
+
+    def progress(self) -> str:
+        with self._lock:
+            names = ", ".join(sorted(self.yes.values()))
+            return f"{len(self.yes)} of {self.required} approved" + (f": {names}" if names else "")
+
+    def waiting_on(self) -> list[str]:
+        with self._lock:
+            return [a.name for a in self.eligible if a.telegram_id not in self.yes]
+
+    def snapshot(self) -> dict:
+        """The live state of this ballot, for the Desktop pane. Names only: ids stay in the ledger."""
+        with self._lock:
+            def state(a: Approver) -> str:
+                if a.telegram_id in self.excluded:
+                    return "requester"
+                if a.name == self.no:
+                    return "no"
+                return "yes" if a.telegram_id in self.yes else "waiting"
+            return {
+                "request_id": self.request_id, "required": self.required, "reason": self.reason, "tier": self.tier,
+                "opened_at": self.opened_at, "timeout": self.timeout,
+                "approvers": [{"name": a.name, "state": state(a)} for a in self.roster or self.eligible],
+                "not_counted": [{"name": n["name"], "why": n["why"], "at": n["at"]} for n in self.not_counted],
+            }
+
     @property
     def outcome(self) -> str:
         with self._lock:
@@ -166,9 +287,17 @@ class Ballot:
             return "once" if len(self.yes) >= self.required else "deny"
 
 
-def open_ballot(policy: Policy, request_id: str, command: str, requester: Requester) -> Ballot:
+def risk_tier(reason: str) -> str:
+    if reason.startswith("critical"):
+        return "critical"
+    return "unknown requester" if reason == "requester unknown" else "standard"
+
+
+def open_ballot(policy: Policy, request_id: str, command: str, requester: Requester,
+                timeout: float = 0.0) -> Ballot:
     need, reason = required_votes(policy, command, requester)
     ballot = Ballot(request_id=request_id, requester=requester, required=need, reason=reason,
+                    roster=policy.approvers, tier=risk_tier(reason), timeout=timeout,
                     eligible=tuple(eligible_approvers(policy, requester)),
                     excluded=frozenset(a.telegram_id for a in policy.approvers
                                        if requester.known and requester.key in a.identity_keys()))
