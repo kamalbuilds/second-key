@@ -211,6 +211,173 @@ class TripwireTests(unittest.TestCase):
         self.assertIsNone(self.tool())
 
 
+    def test_command_allowlist_edit_trips(self):
+        self.edit("approvals:\n  mode: manual", "command_allowlist:\n  - recursive delete\napprovals:\n  mode: manual")
+        out = self.tool()
+        self.assertEqual(out["action"], "block")
+        self.assertIn("command_allowlist", out["message"])
+        self.assertTrue(self.alerts, "approvers were not alerted")
+
+    def gate_trips(self, extra, key):
+        self.edit("approvals:\n  mode: manual", "approvals:\n  mode: manual\n  " + extra)
+        self.assertIn(key, (self.tool() or {}).get("message", ""))
+
+    def test_deny_rules_trip(self):
+        self.gate_trips("deny: ['rm *']", "approvals_deny")
+
+    def test_approvers_trip(self):
+        self.gate_trips("approvers: ['123']", "approvals_approvers")
+
+    def test_timeout_trips(self):
+        self.gate_trips("timeout: 99999", "approvals_timeout")
+
+    def test_status_prints_the_local_identity(self):
+        tokens = set_session_vars(platform="local", user_id="uid:501")
+        try:
+            self.assertIn("local:uid:501", plugin._cmd_secondkey(""))
+        finally:
+            clear_session_vars(tokens)
+        tokens = set_session_vars(platform="telegram", user_id="999")
+        try:
+            self.assertNotIn("local:", plugin._cmd_secondkey(""))
+        finally:
+            clear_session_vars(tokens)
+
+
+class LocalRequesterTests(Base):
+    """A local session binds local:uid:<uid>, which matches no roster entry."""
+
+    def policy(self, aliases=(), **settings):
+        plugin._policy = lambda: plugin.quorum.parse_policy({"approvers": [
+            {"name": "Kamal", "telegram_id": "111", "aliases": list(aliases)},
+            {"name": "Kaveri", "telegram_id": "222"}], **settings})
+
+    def run_present(self, votes):
+        """Present a command from a local session; each approver's DM triggers these taps."""
+        results = []
+
+        class Bot:
+            def send_ballot(self, chat_id, text, request_id):
+                results.extend(plugin._on_vote(request_id, voter, "once") for voter in votes)
+                return 1
+
+            def close_ballot(self, *args):
+                pass
+        plugin._bot = lambda: (Bot(), SimpleNamespace(ensure_running=lambda: None))
+        req = request("echo ok")
+        self.bind(req, platform="local", user_id="uid:501")
+        return plugin.present(req).choice, results
+
+    def test_unlisted_local_requester_is_unknown_and_needs_two(self):
+        self.policy()
+        for platform in ("local", "cli", "tui", "desktop"):
+            need, reason = plugin.quorum.required_votes(plugin._policy(), "ls", plugin.quorum.Requester(platform, "uid:501"))
+            self.assertEqual((need, reason), (2, "requester unknown"), platform)
+
+    def test_lone_approver_cannot_approve_a_local_turn_alone(self):
+        plugin._policy = lambda: plugin.quorum.parse_policy({"approvers": [{"name": "Kamal", "telegram_id": "111"}]})
+        req = request("echo ok")
+        self.bind(req, platform="local", user_id="uid:501")
+        self.assertEqual(plugin.present(req).choice, "deny")  # one eligible approver, two votes needed
+
+    def test_aliased_local_requester_is_excluded_and_the_normal_rule_applies(self):
+        self.policy(aliases=["local:uid:501"])
+        need, _ = plugin.quorum.required_votes(plugin._policy(), "ls", plugin.quorum.Requester("local", "uid:501"))
+        self.assertEqual(need, 1)
+        choice, results = self.run_present(votes=["111", "222"])
+        self.assertEqual((choice, results), ("once", ["ignored:requester", "approved"]))
+
+    def test_aliased_requester_alone_is_denied(self):
+        plugin._policy = lambda: plugin.quorum.parse_policy({"approvers": [
+            {"name": "Kamal", "telegram_id": "111", "aliases": ["local:uid:501"]}]})
+        req = request("echo ok")
+        self.bind(req, platform="local", user_id="uid:501")
+        self.assertEqual(plugin.present(req).choice, "deny")
+
+    def test_other_users_local_id_is_not_excluded(self):
+        self.policy(aliases=["local:uid:501"])
+        need, _ = plugin.quorum.required_votes(plugin._policy(), "ls", plugin.quorum.Requester("local", "uid:502"))
+        self.assertEqual(need, 2)
+
+
+class OwnDataTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.data = Path(self.temp.name) / "plugin-data" / "second-key"
+        self.data.mkdir(parents=True)
+        self.saved_armed = plugin._armed_file
+        plugin._armed_file = lambda: self.data / "armed.json"
+        plugin._tripped, plugin._armed_view = [], None
+
+    def tearDown(self):
+        plugin._armed_file = self.saved_armed
+        super().tearDown()
+
+    def blocked(self, tool, **args):
+        out = plugin._on_pre_tool_call(tool_name=tool, args=args)
+        return bool(out) and out.get("action") == "block"
+
+    def test_write_tools_cannot_touch_the_ledger_or_armed_file(self):
+        self.assertTrue(self.blocked("write_file", path=str(self.data / "ledger.jsonl"), content="x"))
+        self.assertTrue(self.blocked("patch", path=str(self.data / "armed.json"), old_string="a", new_string="b"))
+        self.assertTrue(self.blocked("patch", mode="patch", patch=f"*** Update File: {self.data}/ledger.jsonl\n"))
+
+    def test_shell_naming_the_ledger_is_refused(self):
+        self.assertTrue(self.blocked("terminal", command=f"echo '{{}}' >> {self.data}/ledger.jsonl"))
+        self.assertTrue(self.blocked("terminal", command="python -c \"open('armed.json','w')\""))
+        self.assertTrue(self.blocked("terminal", command="cp x ~/.hermes/plugin-data/second-key/ledger.jsonl"))
+
+    def test_ordinary_files_are_not_blocked(self):
+        self.assertFalse(self.blocked("write_file", path=str(Path(self.temp.name) / "notes.md"),
+                                      content="second-key keeps ledger.jsonl and armed.json"))
+        self.assertFalse(self.blocked("terminal", command="pytest -q"))
+
+
+class DefaultCriticalPatternTests(unittest.TestCase):
+    def need(self, command, **settings):
+        policy = plugin.quorum.parse_policy({"approvers": [{"telegram_id": "111"}, {"telegram_id": "222"}], **settings})
+        return plugin.quorum.required_votes(policy, command, plugin.quorum.Requester("telegram", "999"))[0]
+
+    def test_defaults_make_destructive_commands_critical(self):
+        for command in ("rm -rf /srv/builds/staging", "rm -fr x", "rm -r -f x", "RM -RF x", "psql -c 'DROP TABLE users'",
+                        "drop database prod", "terraform destroy -auto-approve", "git push --force origin main",
+                        "git push origin main -f", "git push --force-with-lease", "mkfs.ext4 /dev/sda1",
+                        "dd if=/dev/zero of=/dev/sda", "kubectl delete namespace prod", "kubectl delete ns prod"):
+            self.assertEqual(self.need(command), 2, command)
+
+    def test_ordinary_commands_are_not_critical(self):
+        for command in ("ls -la", "rm notes.txt", "git push origin main", "git push origin feature-fix",
+                        "kubectl delete pod web-1", "dd if=a.img of=b.img", "terraform plan", "echo drop tables"):
+            self.assertEqual(self.need(command), 1, command)
+
+    def test_configured_list_replaces_the_default(self):
+        self.assertEqual(self.need("rm -rf /x", critical_patterns=["shutdown"]), 1)
+        self.assertEqual(self.need("shutdown now", critical_patterns=["shutdown"]), 2)
+        self.assertEqual(self.need("rm -rf /x", critical_patterns=[]), 1)
+
+
+class LedgerFailureTests(Base):
+    def test_unwritable_ledger_denies_a_met_quorum_and_logs_an_error(self):
+        class Broken:
+            def append(self, *a, **k):
+                raise OSError("disk full")
+        plugin._get_ledger = lambda: Broken()
+
+        class Bot:
+            def send_ballot(self, chat_id, text, request_id):
+                plugin._on_vote(request_id, "222", "once")
+                return 1
+
+            def close_ballot(self, *args):
+                pass
+        plugin._bot = lambda: (Bot(), SimpleNamespace(ensure_running=lambda: None))
+        req = request()
+        self.bind(req, platform="telegram", actor_id="111", actor_name="Priya")
+        with self.assertLogs(plugin.logger, level="ERROR") as logs:
+            self.assertEqual(plugin.present(req).choice, "deny")
+        self.assertTrue(any("could not be recorded" in line for line in logs.output), logs.output)
+
+
 class WorkerThreadContextTests(unittest.TestCase):
     """The multiplexed gateway binds the profile's Hermes home and secret scope on the session
     thread only. Hermes then runs present() on a bare thread, which has neither."""

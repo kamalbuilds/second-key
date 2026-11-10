@@ -6,6 +6,11 @@ feeds this module and acts on what it returns.
 The rule: the person whose message raised the approval can never answer it. The other
 approvers on the roster can, and a request needs ``required`` distinct yes votes from them.
 One no from any eligible approver denies it at once.
+
+A local session (CLI, TUI, Desktop) binds an id like ``local:uid:501`` that no roster entry
+carries, so second-key cannot tell whether the machine owner is also an approver. Such a requester
+counts as unknown, and ``unknown_requester_required`` applies, until an approver lists that id in
+``aliases``: then that approver is excluded as the requester and the normal rule applies.
 """
 
 from __future__ import annotations
@@ -14,6 +19,22 @@ import re
 import threading
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
+
+
+LOCAL_PLATFORMS = frozenset({"local", "cli", "tui", "desktop", "acp"})
+
+# Used when ``critical_patterns`` is not configured. A configured list, even an empty one, replaces it.
+DEFAULT_CRITICAL_PATTERNS = (
+    r"\brm\s+-\w*(rf|fr)",
+    r"\brm\s+-r\s+-f",
+    r"\brm\s+-f\s+-r",
+    r"\bdrop\s+(table|database)\b",
+    r"\bterraform\s+destroy\b",
+    r"\bgit\s+push\b.*\s(-f|--force|--force-with-lease)\b",
+    r"\bmkfs(\.\w+)?\b",
+    r"\bdd\b.*\bof=/dev/",
+    r"\bkubectl\s+delete\s+(namespaces?|ns)\b",
+)
 
 
 @dataclass(frozen=True)
@@ -53,11 +74,22 @@ class Policy:
     approvers: tuple[Approver, ...]
     required: int = 1
     critical_required: int = 2
-    critical_patterns: tuple[str, ...] = ()
+    critical_patterns: tuple[str, ...] = DEFAULT_CRITICAL_PATTERNS
     unknown_requester_required: int = 2
+    patterns_configured: bool = False
 
     def compiled_critical(self) -> list[re.Pattern]:
         return [re.compile(p, re.IGNORECASE) for p in self.critical_patterns]
+
+
+def identified(policy: Policy, requester: Requester) -> bool:
+    """Whether second-key can say who asked. A local requester is identified only when an approver
+    lists its id in ``aliases``; otherwise the machine owner could be anyone, approvers included."""
+    if not requester.known:
+        return False
+    if requester.platform.lower() in LOCAL_PLATFORMS:
+        return any(requester.key in a.identity_keys() for a in policy.approvers)
+    return True
 
 
 def required_votes(policy: Policy, command: str, requester: Requester) -> tuple[int, str]:
@@ -68,7 +100,7 @@ def required_votes(policy: Policy, command: str, requester: Requester) -> tuple[
             if policy.critical_required > need:
                 need, reason = policy.critical_required, f"critical pattern {pattern.pattern!r}"
             break
-    if not requester.known and policy.unknown_requester_required > need:
+    if not identified(policy, requester) and policy.unknown_requester_required > need:
         need, reason = policy.unknown_requester_required, "requester unknown"
     return need, reason
 
@@ -88,6 +120,7 @@ class Ballot:
     required: int
     reason: str
     eligible: tuple[Approver, ...]
+    excluded: frozenset[str] = frozenset()               # telegram ids of approvers who are the requester
     yes: dict[str, str] = field(default_factory=dict)   # telegram_id -> name
     no: Optional[str] = None                             # name of the approver who denied
     ignored: list[str] = field(default_factory=list)    # why a vote was refused, for the ledger
@@ -105,7 +138,7 @@ class Ballot:
         with self._lock:
             if self.done.is_set():
                 return "ignored:closed"
-            if self.requester.known and self.requester.key == f"telegram:{voter}":
+            if voter in self.excluded or (self.requester.known and self.requester.key == f"telegram:{voter}"):
                 self.ignored.append(f"requester {voter} tried to approve their own request")
                 return "ignored:requester"
             match = next((a for a in self.eligible if a.telegram_id == voter), None)
@@ -136,7 +169,9 @@ class Ballot:
 def open_ballot(policy: Policy, request_id: str, command: str, requester: Requester) -> Ballot:
     need, reason = required_votes(policy, command, requester)
     ballot = Ballot(request_id=request_id, requester=requester, required=need, reason=reason,
-                    eligible=tuple(eligible_approvers(policy, requester)))
+                    eligible=tuple(eligible_approvers(policy, requester)),
+                    excluded=frozenset(a.telegram_id for a in policy.approvers
+                                       if requester.known and requester.key in a.identity_keys()))
     if ballot.impossible:
         ballot.done.set()  # fail closed: not enough people besides the requester to ever approve
     return ballot
@@ -166,7 +201,10 @@ def parse_policy(cfg: dict) -> Policy:
                 raise ValueError(f"identity {key} is listed for two approvers")
             seen_keys.add(key)
         approvers.append(Approver(name=str(entry.get("name") or tid), telegram_id=tid, aliases=aliases))
-    patterns = tuple(str(p) for p in cfg.get("critical_patterns") or [])
+    configured = cfg.get("critical_patterns") is not None
+    if configured and not isinstance(cfg["critical_patterns"], list):
+        raise ValueError("critical_patterns must be a list")
+    patterns = tuple(str(p) for p in cfg["critical_patterns"]) if configured else DEFAULT_CRITICAL_PATTERNS
     for p in patterns:
         re.compile(p, re.IGNORECASE)
     return Policy(
@@ -174,6 +212,7 @@ def parse_policy(cfg: dict) -> Policy:
         required=_positive_int(cfg.get("required", 1), "required"),
         critical_required=_positive_int(cfg.get("critical_required", 2), "critical_required"),
         critical_patterns=patterns,
+        patterns_configured=configured,
         unknown_requester_required=_positive_int(cfg.get("unknown_requester_required", 2),
                                                  "unknown_requester_required"),
     )
@@ -201,5 +240,7 @@ def describe(policy: Policy) -> Iterable[str]:
     yield f"{len(policy.approvers)} approver(s); requester never counts"
     yield f"default: {policy.required} yes vote(s) from someone other than the requester"
     if policy.critical_patterns:
-        yield f"critical patterns ({len(policy.critical_patterns)}): {policy.critical_required} yes votes"
-    yield f"requester unknown: {policy.unknown_requester_required} yes votes"
+        source = "configured" if policy.patterns_configured else "built-in default"
+        yield f"critical patterns ({len(policy.critical_patterns)}, {source}): {policy.critical_required} yes votes"
+    yield (f"requester unknown, or a local session no approver lists in aliases: "
+           f"{policy.unknown_requester_required} yes votes")

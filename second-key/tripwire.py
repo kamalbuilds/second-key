@@ -21,6 +21,13 @@ def _mode(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _list(value: Any) -> list:
+    """Hermes accepts a bare string for command_allowlist; compare lists either way."""
+    if isinstance(value, str):
+        value = [value]
+    return sorted(str(v) for v in value) if isinstance(value, (list, tuple)) else []
+
+
 def watched(cfg: dict, plugin_key: str, transport: str) -> dict:
     """The parts of config.yaml that decide who approves what."""
     security = ((cfg.get("security") or {}).get("approval") or {})
@@ -36,6 +43,14 @@ def watched(cfg: dict, plugin_key: str, transport: str) -> dict:
         "cron_mode": _mode(approvals.get("cron_mode")),
         "single_query_mode": _mode(approvals.get("single_query_mode")),
         "unattended_mode": _mode(approvals.get("unattended_mode")),
+        # Hermes re-reads these on every approval, so a hand edit changes what needs a vote without
+        # a restart: a command_allowlist entry (glob or pattern key like "recursive delete") is
+        # waved through before the transport is called, and the others loosen or reroute the gate.
+        "command_allowlist": _list(cfg.get("command_allowlist")),
+        "approvals_deny": _list(approvals.get("deny")),
+        "approvals_approvers": _list(approvals.get("approvers")),
+        "approvals_smart_policy": str(approvals.get("smart_policy") or "").strip(),
+        "approvals_timeout": str(approvals.get("timeout") or "").strip(),
         "isolation": str(plugins.get("isolation") or "").strip().lower(),
         "plugin_listed_enabled": plugin_key in (enabled or []) if isinstance(enabled, list) else None,
         "plugin_listed_disabled": plugin_key in (disabled or []) if isinstance(disabled, list) else False,

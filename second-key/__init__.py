@@ -12,9 +12,11 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from . import quorum, tripwire
@@ -87,8 +89,8 @@ def _get_ledger() -> Ledger:
 def _record(event: str, **fields) -> dict | None:
     try:
         return _get_ledger().append(event, **fields)
-    except Exception as exc:  # a broken ledger must never decide an approval
-        logger.warning("second-key: ledger write failed (%s)", type(exc).__name__)
+    except Exception as exc:  # a broken ledger never approves: _present denies when "decided" is not written
+        logger.error("second-key: ledger write failed for %r (%s: %s)", event, type(exc).__name__, exc)
         return None
 
 
@@ -173,13 +175,16 @@ def _arg_text(args) -> str:
     return str(args or "")
 
 
-def _under_ssh_dir(path: str) -> bool:
-    from pathlib import Path
+def _under(path: str, root) -> bool:
     try:
-        target = Path(path).expanduser().resolve()
-        return target.is_relative_to((Path.home() / ".ssh").resolve())
+        return Path(path).expanduser().resolve().is_relative_to(Path(root).resolve())
     except (OSError, ValueError, RuntimeError):
         return False
+
+
+def _names_own_data(text: str, data_dir) -> bool:
+    """Whether text names this plugin's data directory, its ledger or its armed file."""
+    return any(token in text for token in (str(data_dir), "plugin-data/second-key", "ledger.jsonl", "armed.json"))
 
 
 def _config_path():
@@ -282,17 +287,37 @@ def _on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
             "second-key: Hermes' approval settings changed since they were armed ("
             + ", ".join(reasons)[:300] + "). Tools are stopped until the profile owner runs "
             "/secondkey arm from a local Hermes session.")}
-    if name in _WRITE_TOOLS and isinstance(args, dict) and _under_ssh_dir(str(args.get("path") or args.get("file_path") or "")):
-        _record("tool_refused", tool=name, why="writes into the SSH directory")
+    if name in _WRITE_TOOLS and isinstance(args, dict):
+        target = str(args.get("path") or args.get("file_path") or "")
+        if _under(target, Path.home() / ".ssh"):
+            _record("tool_refused", tool=name, why="writes into the SSH directory")
+            return {"action": "block", "message": (
+                "second-key: writes into the SSH directory can make later ssh commands run anything, and Hermes "
+                "asks for them in chat where the requester can answer. Refused.")}
+    if name in _WRITE_TOOLS | _EXEC_TOOLS and _touches_own_data(name, args):
+        _record("tool_refused", tool=name, why="touches second-key's own ledger or armed settings")
         return {"action": "block", "message": (
-            "second-key: writes into the SSH directory can make later ssh commands run anything, and Hermes "
-            "asks for them in chat where the requester can answer. Refused.")}
+            "second-key: its ledger and armed settings are written only by second-key. "
+            "Read the ledger with /secondkey ledger.")}
     if name in _EXEC_TOOLS and _TAMPER.search(_arg_text(args)):
         _record("tool_refused", tool=name, why="changes approval configuration")
         return {"action": "block", "message": (
             "second-key: this would change Hermes' approval settings or turn second-key off. "
             "Only the profile owner can do that, from outside the agent.")}
     return None
+
+
+def _touches_own_data(name: str, args) -> bool:
+    try:
+        data_dir = _armed_file().parent
+    except Exception:
+        return False
+    if name in _WRITE_TOOLS:  # file content may mention the names; only the target path and a V4A patch body count
+        if not isinstance(args, dict):
+            return False
+        return (_under(str(args.get("path") or args.get("file_path") or ""), data_dir)
+                or _names_own_data(str(args.get("patch") or ""), data_dir))
+    return _names_own_data(_arg_text(args), data_dir)
 
 
 def _on_vote(request_id: str, voter: str, choice: str) -> str:
@@ -397,6 +422,10 @@ def _present(request) -> Any:
     outcome = ballot.outcome
     entry = _record("decided", **base, outcome=outcome, yes=sorted(ballot.yes.values()), no=ballot.no,
                     ignored=ballot.ignored)
+    if entry is None and outcome == "once":
+        logger.error("second-key: approval %s met its quorum but the decision could not be recorded; denying",
+                     request.request_id)
+        outcome = "deny"  # no approval without a record of who gave it
     summary = _closing_text(request, ballot, outcome)
     if entry:
         summary += f"\n\nledger {entry['hash'][:16]}"
@@ -432,12 +461,27 @@ def _closing_text(request, ballot: quorum.Ballot, outcome: str) -> str:
         verdict = f"Approved once by {', '.join(sorted(ballot.yes.values()))}."
     elif ballot.no:
         verdict = f"Denied by {ballot.no}."
+    elif len(ballot.yes) >= ballot.required:
+        verdict = "Denied: the approvals could not be written to the ledger."
     else:
         verdict = f"Denied: {len(ballot.yes)} of {ballot.required} approval(s) before the deadline."
     return f"{verdict}\n\n{request.command}"
 
 
 # ---------------------------------------------------------------- command
+
+def _local_identity() -> str:
+    """The id Hermes binds for a local session, in the form an approver lists under ``aliases``.
+    Empty when the call comes from a chat."""
+    platform = _session("HERMES_SESSION_PLATFORM").lower()
+    if platform and platform not in quorum.LOCAL_PLATFORMS:
+        return ""
+    actor = _session("HERMES_SESSION_ACTOR_ID") or _session("HERMES_SESSION_USER_ID")
+    if actor:
+        return f"{platform or 'local'}:{actor}"
+    uid = getattr(os, "getuid", None)
+    return f"local:uid:{uid()}" if uid else ""
+
 
 def _cmd_secondkey(args: str = "", **kwargs) -> str:
     global _enroll_until
@@ -448,8 +492,8 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
         entries = _get_ledger().tail(n)
         ok, bad = _get_ledger().verify()
         head = f"ledger chain {'intact' if ok else f'BROKEN at line {bad}'}"
-        return "\n".join([head] + [f"{e['ts']} {e['event']} {e.get('outcome') or e.get('result') or ''}".rstrip()
-                                   for e in entries])
+        return "\n".join([head] + [" ".join(filter(None, (e["ts"], e["event"], e.get("outcome") or e.get("result"),
+                                                           e["hash"][:16]))) for e in entries])
     if action == "enroll":
         try:
             _, poller = _bot()
@@ -494,6 +538,10 @@ def _cmd_secondkey(args: str = "", **kwargs) -> str:
     else:
         lines.append(f"ARMED (settings fingerprint {tripwire.fingerprint(_armed_view)[:16]})")
     lines.extend(quorum.describe(policy))
+    identity = _local_identity()
+    if identity:
+        lines.append(f"this local session is {identity}: list it under your approver entry's aliases "
+                     "to exclude yourself as the requester")
     from agent.secret_scope import get_secret
     lines.append(f"bot token: {'set' if get_secret(TOKEN_ENV) else 'MISSING'} ({TOKEN_ENV})")
     lines.append(f"select it with security.approval.transport: {TRANSPORT}")

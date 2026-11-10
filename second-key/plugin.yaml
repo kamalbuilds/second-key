@@ -16,7 +16,9 @@ config_schema:
   approvers:
     type: list
     default: []
-    description: Telegram approvers and their optional platform aliases.
+    description: >-
+      Telegram approvers and their optional aliases: the same person's ids on other platforms, and
+      a local session's id (local:uid:501, printed by /secondkey) to exclude them as the requester.
   required:
     type: int
     default: 1
@@ -27,12 +29,16 @@ config_schema:
     description: Yes votes required when a critical pattern matches.
   critical_patterns:
     type: list
-    default: []
-    description: Regular expressions matching critical commands.
+    description: >-
+      Regular expressions matching critical commands. Unset, a built-in list applies: rm -rf
+      variants, drop table or database, terraform destroy, git push --force, formatting a filesystem, dd to a
+      /dev device, kubectl delete namespace. A list set here replaces it.
   unknown_requester_required:
     type: int
     default: 2
-    description: Yes votes required when the requester identity is unknown.
+    description: >-
+      Yes votes required when the requester identity is unknown, including a local session that
+      no approver lists in aliases.
   bot_token:
     type: secret
     env: SECONDKEY_TELEGRAM_BOT_TOKEN
