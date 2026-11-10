@@ -3,9 +3,10 @@ api_version: 1
 name: second-key
 version: "0.1.0"
 description: >-
-  A two-person rule for shared Hermes bots. Dangerous commands go to named approvers by Telegram
-  DM, the person who asked can never approve their own request, and critical commands need two
-  approvals. No answer, an error or too few approvers always means deny.
+  Team approvals for shared Hermes bots. Dangerous commands need N votes from your roster by
+  Telegram DM, sized to the risk. The requester never counts, and an agent that edits its own
+  approval settings is stopped on its next tool call. No answer, an error or too few approvers
+  always means deny.
 requires_hermes: ">=0.23.0"
 license: MIT
 provides_hooks:

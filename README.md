@@ -1,6 +1,6 @@
 # second-key
 
-A two-person rule for shared Hermes bots: dangerous commands go to your approvers by Telegram DM, and the person who asked can never approve their own request.
+Team approvals for shared Hermes bots: dangerous commands need N votes from your roster, sized to the risk. The requester never counts, and an agent that edits its own approval settings is stopped on its next tool call. Ballots arrive as Telegram DMs.
 
 ![second-key architecture: tool call, approval gate, requester binding, quorum, Telegram ballots, votes, decision, hash-chained ledger](docs/architecture.svg)
 
@@ -10,7 +10,7 @@ Interactive version: [docs/architecture.html](docs/architecture.html).
 
 - Takes over Hermes' approval step with a transport named `secondkey`, so every flagged `terminal` command and `execute_code` script becomes a ballot.
 - Excludes the requester by id and sends the ballot as a private DM to everyone else on the roster, with **Approve once** and **Deny** buttons.
-- Requires two yes votes for critical commands (`rm -rf`, `terraform destroy`, `git push --force`, `drop table` and more) and for requesters it cannot identify. One deny closes the request.
+- Sizes the quorum to the risk: `critical_required` yes votes for critical commands (`rm -rf`, `terraform destroy`, `git push --force`, `drop table` and more) and `unknown_requester_required` for requesters it cannot identify, two each by default. One deny closes the request.
 - Answers Hermes with `once` or `deny` only. Silence, errors and too few approvers are a deny.
 - Writes every presentation, vote and decision to a hash-chained ledger and puts the first 16 characters of the decision hash in each approver's closing DM.
 - Stops the agent's tools when the approval settings change after arming, and refuses `/yolo` and `/approvals` from chats.

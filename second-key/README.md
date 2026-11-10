@@ -1,8 +1,8 @@
 # second-key
 
-A two-person rule for shared Hermes bots.
+Team approvals for shared Hermes bots: dangerous commands need N votes from your roster, sized to the risk. The requester never counts, and an agent that edits its own approval settings is stopped on its next tool call.
 
-When Hermes wants to run a dangerous command, second-key sends the approval to the people on your roster by Telegram DM. The person whose message started the turn can never approve it: a chat sender is excluded by id, and a local session is excluded once its id is listed in an approver's `aliases`, and counts as an unknown requester needing two approvals until then. Critical commands need two approvals. Silence or any error is a denial: second-key fails closed.
+When Hermes wants to run a dangerous command, second-key sends the approval to the people on your roster by Telegram DM. The person whose message started the turn can never approve it: a chat sender is excluded by id, and a local session is excluded once its id is listed in an approver's `aliases`, and counts as an unknown requester needing `unknown_requester_required` approvals (two by default) until then. Votes needed are set per risk: `required` for ordinary flagged commands, `critical_required` for critical ones, `unknown_requester_required` when the requester cannot be identified. One no closes the request, and silence or any error is a denial: second-key fails closed.
 
 ```
 Priya (in the team group):  @hermes tear down the staging stack
@@ -79,8 +79,10 @@ hermes plugins install kamalbuilds/second-key/second-key --enable
              - { name: Priya, telegram_id: "111111111", aliases: ["discord:4242", "local:uid:501"] }
              - { name: Dev,   telegram_id: "222222222" }
              - { name: Sam,   telegram_id: "333333333" }
+             - { name: Mei,   telegram_id: "444444444" }
+             - { name: Omar,  telegram_id: "555555555" }
            required: 1
-           critical_required: 2
+           critical_required: 3
            unknown_requester_required: 2
    security:
      approval:
@@ -116,7 +118,7 @@ The suite drives the plugin through Hermes' real `ApprovalRequest`, `invoke_appr
 - another approver approving
 - an approver denying
 - a critical command with one yes vote (denied)
-- a critical command with two yes votes (approved)
+- a critical command that reaches its `critical_required` yes votes (approved)
 - too few eligible approvers (denied, no DM sent)
 - ledger tampering (chain reported broken), and file or shell tool calls that write the ledger or armed file (refused)
 - an unwritable ledger (a met quorum is denied and the error logged)
