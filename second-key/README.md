@@ -2,7 +2,7 @@
 
 A two-person rule for shared Hermes bots.
 
-When Hermes wants to run a dangerous command, second-key sends the approval to the people on your roster by Telegram DM. The person whose message started the turn can never approve it. Critical commands need two approvals. If nobody answers, or something breaks, the command does not run.
+When Hermes wants to run a dangerous command, second-key sends the approval to the people on your roster by Telegram DM. The person whose message started the turn can never approve it. Critical commands need two approvals. Silence or any error is a denial: second-key fails closed.
 
 ```
 Priya (in the team group):  @hermes tear down the staging stack
@@ -54,6 +54,12 @@ second-key denies at once, and DMs nobody, when:
 Hermes asks for some other approvals (protected file writes, computer use, MCP elicitation) on its own chat prompts, which do not go through approval transports. `/secondkey` checks whether second-key is actually armed: selected as the transport, no builtin fallback, and `approvals.mode` not `off` or `smart`.
 
 ## Setup
+
+Install and enable:
+
+```sh
+hermes plugins install kamalbuilds/second-key/second-key --enable
+```
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) for second-key. Use a separate bot from your Hermes gateway bot: two programs reading one bot's updates conflict.
 2. Put its token in your Hermes profile:
