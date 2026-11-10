@@ -531,7 +531,8 @@ class CatalogReviewTests(unittest.TestCase):
             with patch.dict(os.environ, {"HERMES_HOME": home}):
                 view = plugin._current_view()
         self.assertEqual(plugin.tripwire.problems(view), [])
-        self.assertEqual(len(view["settings"]["approvers"]), 3)
+        self.assertEqual(len(view["settings"]["approvers"]), 5)
+        self.assertEqual(view["settings"]["critical_required"], 3)
 
     def test_unattended_approve_modes_refuse_to_arm(self):
         for key in ("cron_mode", "single_query_mode", "unattended_mode"):
